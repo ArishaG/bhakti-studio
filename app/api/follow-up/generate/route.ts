@@ -127,7 +127,7 @@ export async function POST() {
         // Group by series_id, exclude soulfest
         const bySeries = new Map<string, AttRow[]>()
         for (const att of atts) {
-          const tag = att.event_instances?.event_series?.tag
+          const tag = att.event_instances?.event_series[0]?.tag
           if (!tag || tag === 'soulfest') continue
           const sid = att.event_instances!.series_id
           if (!bySeries.has(sid)) bySeries.set(sid, [])
