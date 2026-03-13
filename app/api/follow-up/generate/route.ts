@@ -68,7 +68,7 @@ export async function POST() {
     ])
 
   const personList = (people as PersonRow[]) ?? []
-  const attList = (rawAtts as AttRow[]) ?? []
+  const attList = (rawAtts as unknown as AttRow[]) ?? []
   const existingList = existingFlags ?? []
 
   // ── 2. Build lookup structures ─────────────────────────────────────────────
