@@ -99,7 +99,7 @@ export default function ProfilesPage() {
         attendances ( id, event_instances ( event_series ( name, tag ) ) )
       `)
       .order('name')
-    setPeople((data as Person[]) ?? [])
+    setPeople((data as unknown as Person[]) ?? [])
     setLoading(false)
   }
 
@@ -118,7 +118,7 @@ export default function ProfilesPage() {
       `)
       .eq('person_id', person.id)
       .order('checked_in_at', { ascending: false })
-    setDetailAttendances((data as AttendanceDetail[]) ?? [])
+    setDetailAttendances((data as unknown as AttendanceDetail[]) ?? [])
     setDetailLoading(false)
   }
 

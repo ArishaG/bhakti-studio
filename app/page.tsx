@@ -127,8 +127,8 @@ export default function HomePage() {
     setActiveCount(count ?? 0)
 
     if (nextEvt) {
-      setNextEvent(nextEvt as NextEvent)
-      await loadEstimatedAttendance((nextEvt as NextEvent).series_id)
+      setNextEvent(nextEvt as unknown as NextEvent)
+      await loadEstimatedAttendance((nextEvt as unknown as NextEvent).series_id)
     }
   }
 
@@ -172,7 +172,7 @@ export default function HomePage() {
       .gte('date', start.toISOString())
       .lt('date', end.toISOString())
       .order('date')
-    setCalEvents((data as CalEvent[]) ?? [])
+    setCalEvents((data as unknown as CalEvent[]) ?? [])
     setCalLoading(false)
   }
 
@@ -185,7 +185,7 @@ export default function HomePage() {
       )
       .eq('resolved', false)
       .order('created_at', { ascending: false })
-    setFlags((data as FlagWithPerson[]) ?? [])
+    setFlags((data as unknown as FlagWithPerson[]) ?? [])
     setFlagsLoading(false)
   }
 
