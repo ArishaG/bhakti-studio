@@ -140,10 +140,32 @@ export default function EventsPage() {
   const [recLoading, setRecLoading] = useState(false)
   const [loading, setLoading] = useState(true)
   const [archiveOpen, setArchiveOpen] = useState(false)
+  const [syncing, setSyncing] = useState(false)
+  const [syncResult, setSyncResult] = useState<string | null>(null)
 
   useEffect(() => {
     loadData()
   }, [])
+
+  async function syncArketa() {
+    setSyncing(true)
+    setSyncResult(null)
+    try {
+      const res = await fetch('/api/sync/arketa', { method: 'POST' })
+      if (res.ok) {
+        const r = await res.json()
+        setSyncResult(
+          `+${r.seriesCreated} series, +${r.instancesCreated} events, +${r.attendancesCreated} attendances`
+        )
+        await loadData()
+      } else {
+        setSyncResult('Sync failed. Try again.')
+      }
+    } catch {
+      setSyncResult('Sync failed. Try again.')
+    }
+    setSyncing(false)
+  }
 
   async function loadData() {
     setLoading(true)
@@ -209,11 +231,34 @@ export default function EventsPage() {
   return (
     <div className="min-h-screen bg-cream pt-16">
       <div className="max-w-2xl mx-auto px-4 pt-6 pb-16">
-        <div className="flex items-center justify-between mb-5">
+        <div className="flex items-center justify-between mb-3">
           <h1 className="text-2xl font-bold text-espresso">Events</h1>
           <span className="text-xs text-walnut bg-parchment px-3 py-1.5 rounded-full">
             Sorted by return rate
           </span>
+        </div>
+
+        <div className="flex items-center gap-3 mb-5">
+          <button
+            onClick={syncArketa}
+            disabled={syncing}
+            className="flex items-center gap-1.5 text-xs font-medium bg-parchment hover:bg-walnut/20 disabled:opacity-50 text-walnut px-3 py-1.5 rounded-full transition-colors"
+          >
+            {syncing ? (
+              <>
+                <div className="w-3 h-3 border border-walnut/60 border-t-transparent rounded-full animate-spin" />
+                Syncing…
+              </>
+            ) : (
+              <>
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Sync Arketa
+              </>
+            )}
+          </button>
+          {syncResult && <span className="text-xs text-walnut">{syncResult}</span>}
         </div>
 
         {loading ? (
