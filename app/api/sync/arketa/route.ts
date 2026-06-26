@@ -83,6 +83,16 @@ const EXPLICIT_TAGS: Record<string, EventTag> = {
   'lunar new year yoga + diy lantern  art workshop': 'other',
 }
 
+const CANONICAL_SOULFEST_NAME = 'Kirtan Soulfest | Guided Music Meditation'
+
+// Special-edition Soulfest classes (holiday/anniversary/location variants)
+// fold into one canonical series rather than each becoming its own
+// one-instance series — they're the same recurring program.
+function canonicalSeriesName(name: string): string {
+  const trimmed = name.trim()
+  return trimmed.toLowerCase().includes('soulfest') ? CANONICAL_SOULFEST_NAME : trimmed
+}
+
 function classifySeries(name: string): EventTag {
   const key = name.trim().toLowerCase()
   if (key.includes('soulfest')) return 'soulfest'
@@ -131,7 +141,7 @@ export async function POST() {
   )
 
   // ── event_series ────────────────────────────────────────────────────────
-  const uniqueNames = [...new Set(classes.map(c => c.name.trim()))]
+  const uniqueNames = [...new Set(classes.map(c => canonicalSeriesName(c.name)))]
 
   const { data: existingSeries } = await supabase.from('event_series').select('id, name')
   const seriesIdByName = new Map((existingSeries ?? []).map(s => [s.name, s.id as string]))
@@ -163,7 +173,7 @@ export async function POST() {
     existingId ? instancesUpdated++ : instancesCreated++
     return {
       ...(existingId ? { id: existingId } : {}),
-      series_id: seriesIdByName.get(c.name.trim()),
+      series_id: seriesIdByName.get(canonicalSeriesName(c.name)),
       date: c.start_time,
       arketa_id: c.id,
       instructor_name: c.instructor_name?.trim() || null,
