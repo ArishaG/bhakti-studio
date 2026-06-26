@@ -142,6 +142,8 @@ export default function EventsPage() {
   const [archiveOpen, setArchiveOpen] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [syncResult, setSyncResult] = useState<string | null>(null)
+  const [syncingEB, setSyncingEB] = useState(false)
+  const [syncResultEB, setSyncResultEB] = useState<string | null>(null)
 
   useEffect(() => {
     loadData()
@@ -165,6 +167,26 @@ export default function EventsPage() {
       setSyncResult('Sync failed. Try again.')
     }
     setSyncing(false)
+  }
+
+  async function syncEventbrite() {
+    setSyncingEB(true)
+    setSyncResultEB(null)
+    try {
+      const res = await fetch('/api/sync/eventbrite', { method: 'POST' })
+      if (res.ok) {
+        const r = await res.json()
+        setSyncResultEB(
+          `${r.eventsMatched} events matched, +${r.attendancesCreated} attendances`
+        )
+        await loadData()
+      } else {
+        setSyncResultEB('Sync failed. Try again.')
+      }
+    } catch {
+      setSyncResultEB('Sync failed. Try again.')
+    }
+    setSyncingEB(false)
   }
 
   async function loadData() {
@@ -259,6 +281,27 @@ export default function EventsPage() {
             )}
           </button>
           {syncResult && <span className="text-xs text-walnut">{syncResult}</span>}
+
+          <button
+            onClick={syncEventbrite}
+            disabled={syncingEB}
+            className="flex items-center gap-1.5 text-xs font-medium bg-parchment hover:bg-walnut/20 disabled:opacity-50 text-walnut px-3 py-1.5 rounded-full transition-colors"
+          >
+            {syncingEB ? (
+              <>
+                <div className="w-3 h-3 border border-walnut/60 border-t-transparent rounded-full animate-spin" />
+                Syncing…
+              </>
+            ) : (
+              <>
+                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Sync Eventbrite
+              </>
+            )}
+          </button>
+          {syncResultEB && <span className="text-xs text-walnut">{syncResultEB}</span>}
         </div>
 
         {loading ? (
