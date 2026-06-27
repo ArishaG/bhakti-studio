@@ -17,7 +17,7 @@ type AttRow = {
   event_instances: {
     series_id: string
     date: string
-    event_series: { name: string; tag: string }[]
+    event_series: { name: string; tag: string } | null
   } | null
 }
 
@@ -100,10 +100,10 @@ export async function POST() {
 
     // Partition by series tag
     const soulfestAtts = atts.filter(
-      a => a.event_instances?.event_series[0]?.tag === 'soulfest'
+      a => a.event_instances?.event_series?.tag === 'soulfest'
     )
     const outreachAtts = atts.filter(
-      a => a.event_instances?.event_series[0]?.tag === 'outreach'
+      a => a.event_instances?.event_series?.tag === 'outreach'
     )
 
     // ── Rule 1 ──────────────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ export async function POST() {
         // Group by series_id, exclude soulfest
         const bySeries = new Map<string, AttRow[]>()
         for (const att of atts) {
-          const tag = att.event_instances?.event_series[0]?.tag
+          const tag = att.event_instances?.event_series?.tag
           if (!tag || tag === 'soulfest') continue
           const sid = att.event_instances!.series_id
           if (!bySeries.has(sid)) bySeries.set(sid, [])
@@ -186,7 +186,7 @@ export async function POST() {
       .reverse()
       .map(
         a =>
-          `${a.event_instances?.event_series[0]?.name ?? 'event'} on ${new Date(
+          `${a.event_instances?.event_series?.name ?? 'event'} on ${new Date(
             a.checked_in_at
           ).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`
       )

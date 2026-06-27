@@ -19,7 +19,7 @@ type RawSeries = {
 type RawAttendance = {
   person_id: string
   checked_in_at: string
-  event_instances: { series_id: string; date: string }[]
+  event_instances: { series_id: string; date: string } | null
 }
 
 type SeriesStat = {
@@ -54,7 +54,7 @@ function computeSeriesStats(
   // Group attendances by series_id
   const bySeriesId = new Map<string, RawAttendance[]>()
   for (const att of allAttendances) {
-    const sid = att.event_instances?.[0]?.series_id
+    const sid = att.event_instances?.series_id
     if (!sid) continue
     if (!bySeriesId.has(sid)) bySeriesId.set(sid, [])
     bySeriesId.get(sid)!.push(att)
@@ -65,7 +65,7 @@ function computeSeriesStats(
     allSeries.filter(s => s.tag === 'soulfest' || s.tag === 'classes').map(s => s.id)
   )
   const coreAttendances = allAttendances.filter(
-    a => a.event_instances?.[0]?.series_id && coreIds.has(a.event_instances[0].series_id)
+    a => a.event_instances?.series_id && coreIds.has(a.event_instances.series_id)
   )
 
   return allSeries.map(series => {
@@ -101,7 +101,7 @@ function computeSeriesStats(
 
     // Date range for "enough data" check
     const dates = atts
-      .map(a => a.event_instances?.[0]?.date)
+      .map(a => a.event_instances?.date)
       .filter(Boolean)
       .sort() as string[]
 

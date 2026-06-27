@@ -228,11 +228,13 @@ export default function HomePage() {
     })
   }, [flags])
 
-  // Group calendar events by date key
+  // Group calendar events by date key (local timezone, matching the day-cell
+  // keys below — slicing the UTC ISO string directly would bucket evening
+  // events into the wrong day since UTC rolls over hours before local time).
   const eventsByDate = useMemo(() => {
     const map: Record<string, CalEvent[]> = {}
     for (const evt of calEvents) {
-      const key = evt.date.slice(0, 10)
+      const key = toDateKey(new Date(evt.date))
       if (!map[key]) map[key] = []
       map[key].push(evt)
     }

@@ -276,7 +276,7 @@ function CheckInPageInner() {
   if (view === 'events') {
     return (
       <div className="min-h-screen bg-cream pt-16">
-        <div className="px-4 pt-6 pb-4">
+        <div className="max-w-2xl mx-auto px-4 pt-6 pb-4">
           <h1 className="text-2xl font-bold text-espresso">Check-In</h1>
           <p className="text-walnut text-sm mt-1">
             {new Date().toLocaleDateString('en-US', {
@@ -294,7 +294,7 @@ function CheckInPageInner() {
             <p className="text-walnut text-lg">No events found.</p>
           </div>
         ) : (
-          <div className="px-4 pb-10 space-y-8">
+          <div className="max-w-2xl mx-auto px-4 pb-10 space-y-8">
             {/* Today */}
             <section>
               <h2 className="text-base font-semibold text-espresso mb-3">
@@ -373,42 +373,45 @@ function CheckInPageInner() {
     <div className="min-h-screen bg-cream flex flex-col pt-16">
       {/* Sticky header + search */}
       <div className="sticky top-16 z-10 bg-cream border-b border-parchment px-4 pt-4 pb-3">
-        <div className="flex items-center gap-3 mb-3">
-          <button
-            onClick={() => setView('events')}
-            className="p-1 -ml-1 text-walnut hover:text-espresso transition-colors"
-            aria-label="Back to events"
-          >
-            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-            </svg>
-          </button>
-          <div className="flex-1 min-w-0">
-            <h2 className="text-lg font-bold text-espresso truncate">
-              {selectedEvent?.series.name}
-            </h2>
-            <p className="text-walnut text-xs">
-              {selectedEvent &&
-                new Date(selectedEvent.date).toLocaleTimeString('en-US', {
-                  hour: 'numeric',
-                  minute: '2-digit',
-                })}
-              {' · '}
-              {attendees.length} registered · {checkedInIds.size} checked in
-            </p>
+        <div className="max-w-2xl mx-auto">
+          <div className="flex items-center gap-3 mb-3">
+            <button
+              onClick={() => setView('events')}
+              className="p-1 -ml-1 text-walnut hover:text-espresso transition-colors"
+              aria-label="Back to events"
+            >
+              <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+              </svg>
+            </button>
+            <div className="flex-1 min-w-0">
+              <h2 className="text-lg font-bold text-espresso truncate">
+                {selectedEvent?.series.name}
+              </h2>
+              <p className="text-walnut text-xs">
+                {selectedEvent &&
+                  new Date(selectedEvent.date).toLocaleTimeString('en-US', {
+                    hour: 'numeric',
+                    minute: '2-digit',
+                  })}
+                {' · '}
+                {attendees.length} registered · {checkedInIds.size} checked in
+              </p>
+            </div>
           </div>
+          <input
+            type="search"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search by name or email…"
+            className="w-full px-4 py-3 rounded-xl bg-parchment border border-parchment text-espresso placeholder-walnut/50 focus:outline-none focus:ring-2 focus:ring-terracotta text-base"
+          />
         </div>
-        <input
-          type="search"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          placeholder="Search by name or email…"
-          className="w-full px-4 py-3 rounded-xl bg-parchment border border-parchment text-espresso placeholder-walnut/50 focus:outline-none focus:ring-2 focus:ring-terracotta text-base"
-        />
       </div>
 
       {/* Attendee list */}
       <div className="flex-1 px-4 pt-3 pb-28 overflow-y-auto">
+        <div className="max-w-2xl mx-auto">
         {loading ? (
           <Spinner />
         ) : filtered.length === 0 ? (
@@ -461,6 +464,7 @@ function CheckInPageInner() {
             })}
           </ul>
         )}
+        </div>
       </div>
 
       {/* Floating add button */}
