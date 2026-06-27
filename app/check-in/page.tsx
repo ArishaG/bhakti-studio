@@ -28,6 +28,8 @@ type AttendeeRecord = {
   id: string
   person_id: string
   source: AttendanceSource
+  checked_in: boolean
+  paid: boolean | null
   person: {
     id: string
     name: string
@@ -64,7 +66,9 @@ function CheckInPageInner() {
   const [events, setEvents] = useState<EventWithSeries[]>([])
   const [selectedEvent, setSelectedEvent] = useState<EventWithSeries | null>(null)
   const [attendees, setAttendees] = useState<AttendeeRecord[]>([])
-  const [checkedInIds, setCheckedInIds] = useState<Set<string>>(new Set())
+  const [togglingIds, setTogglingIds] = useState<Set<string>>(new Set())
+  const [reminder, setReminder] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [showAddModal, setShowAddModal] = useState(false)
@@ -142,10 +146,6 @@ function CheckInPageInner() {
       a.person.name.localeCompare(b.person.name)
     )
     setAttendees(records)
-    // Pre-seed: manual attendances are already confirmed
-    setCheckedInIds(
-      new Set(records.filter(r => r.source === 'manual').map(r => r.person_id))
-    )
     setLoading(false)
   }
 
@@ -156,21 +156,49 @@ function CheckInPageInner() {
     loadAttendees(event)
   }
 
-  // Check in a pre-registered attendee (already has an attendance record)
-  async function handleCheckIn(attendee: AttendeeRecord) {
-    if (checkedInIds.has(attendee.person_id)) return
+  async function refreshFromSources() {
+    setRefreshing(true)
+    await Promise.all([
+      fetch('/api/sync/arketa', { method: 'POST' }).catch(() => null),
+      fetch('/api/sync/eventbrite', { method: 'POST' }).catch(() => null),
+    ])
+    if (selectedEvent) await loadAttendees(selectedEvent)
+    setRefreshing(false)
+  }
 
-    // Optimistic UI update
-    setCheckedInIds(prev => new Set([...prev, attendee.person_id]))
+  // Toggle check-in state for a pre-registered attendee. Checking in someone
+  // from an Arketa reservation also pushes the check-in to Arketa; there's
+  // no equivalent for Eventbrite (shows a manual reminder instead) or for
+  // un-checking on Arketa (no documented endpoint — local-only).
+  async function handleToggleCheckIn(attendee: AttendeeRecord, checkedIn: boolean) {
+    setTogglingIds(prev => new Set([...prev, attendee.id]))
+    setAttendees(prev =>
+      prev.map(a => (a.id === attendee.id ? { ...a, checked_in: checkedIn } : a))
+    )
 
-    const count = attendee.person.event_count ?? 0
-    await supabase
-      .from('people')
-      .update({
-        last_seen_at: new Date().toISOString(),
-        ...(count >= 3 && { is_active: true }),
+    try {
+      const res = await fetch('/api/checkin/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attendanceId: attendee.id, checkedIn }),
       })
-      .eq('id', attendee.person_id)
+      if (res.ok) {
+        const result = await res.json()
+        if (result.needsEventbriteReminder) {
+          setReminder(`Also check in ${attendee.person.name} in the Eventbrite app`)
+          setTimeout(() => setReminder(null), 6000)
+        } else if (attendee.source === 'arketa' && checkedIn && !result.arketaPushed) {
+          setReminder(`Checked in locally, but couldn't sync to Arketa for ${attendee.person.name}`)
+          setTimeout(() => setReminder(null), 6000)
+        }
+      }
+    } finally {
+      setTogglingIds(prev => {
+        const next = new Set(prev)
+        next.delete(attendee.id)
+        return next
+      })
+    }
   }
 
   // Add a walk-in not on any pre-registered list
@@ -209,12 +237,12 @@ function CheckInPageInner() {
               person_id: newPerson.id,
               event_instance_id: selectedEvent.id,
               source: 'manual',
+              checked_in: true,
             })
             await supabase.from('duplicate_flags').insert({
               person_id_a: existing.id,
               person_id_b: newPerson.id,
             })
-            setCheckedInIds(prev => new Set([...prev, newPerson.id]))
           }
           await loadAttendees(selectedEvent)
           return { isDuplicate: true }
@@ -225,6 +253,7 @@ function CheckInPageInner() {
           person_id: existing.id,
           event_instance_id: selectedEvent.id,
           source: 'manual',
+          checked_in: true,
         })
         // Trigger handles event_count + last_seen_at; we handle is_active
         const newCount = (existing.event_count ?? 0) + 1
@@ -234,7 +263,6 @@ function CheckInPageInner() {
             .update({ is_active: true })
             .eq('id', existing.id)
         }
-        setCheckedInIds(prev => new Set([...prev, existing.id]))
         await loadAttendees(selectedEvent)
         return { isDuplicate: false }
       }
@@ -252,9 +280,9 @@ function CheckInPageInner() {
         person_id: newPerson.id,
         event_instance_id: selectedEvent.id,
         source: 'manual',
+        checked_in: true,
       })
       // Trigger fires and sets event_count=1, so no is_active check needed yet
-      setCheckedInIds(prev => new Set([...prev, newPerson.id]))
     }
 
     await loadAttendees(selectedEvent)
@@ -395,9 +423,24 @@ function CheckInPageInner() {
                     minute: '2-digit',
                   })}
                 {' · '}
-                {attendees.length} registered · {checkedInIds.size} checked in
+                {attendees.length} registered · {attendees.filter(a => a.checked_in).length} checked in
               </p>
             </div>
+            <button
+              onClick={refreshFromSources}
+              disabled={refreshing}
+              className="shrink-0 p-2 text-walnut hover:text-espresso disabled:opacity-50 transition-colors"
+              aria-label="Refresh from Arketa/Eventbrite"
+            >
+              <svg
+                className={`w-5 h-5 ${refreshing ? 'animate-spin' : ''}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+            </button>
           </div>
           <input
             type="search"
@@ -408,6 +451,14 @@ function CheckInPageInner() {
           />
         </div>
       </div>
+
+      {reminder && (
+        <div className="sticky top-[7.5rem] z-10 max-w-2xl mx-auto w-full px-4">
+          <div className="bg-gold/30 text-espresso text-sm font-medium rounded-xl px-4 py-2.5 mt-2 shadow">
+            {reminder}
+          </div>
+        </div>
+      )}
 
       {/* Attendee list */}
       <div className="flex-1 px-4 pt-3 pb-28 overflow-y-auto">
@@ -423,7 +474,8 @@ function CheckInPageInner() {
         ) : (
           <ul className="space-y-2">
             {filtered.map(attendee => {
-              const isIn = checkedInIds.has(attendee.person_id)
+              const isIn = attendee.checked_in
+              const isToggling = togglingIds.has(attendee.id)
               return (
                 <li
                   key={attendee.id}
@@ -440,21 +492,39 @@ function CheckInPageInner() {
                         {attendee.person.email}
                       </p>
                     )}
-                    <span className="text-xs text-walnut/50 capitalize mt-0.5 block">
-                      {attendee.source}
-                    </span>
+                    <div className="flex items-center gap-2 mt-0.5">
+                      <span className="text-xs text-walnut/50 capitalize">
+                        {attendee.source}
+                      </span>
+                      {attendee.paid !== null && (
+                        <span
+                          className={`text-xs font-medium px-1.5 py-0.5 rounded ${
+                            attendee.paid
+                              ? 'bg-gold/30 text-espresso'
+                              : 'bg-terracotta/15 text-terracotta'
+                          }`}
+                        >
+                          {attendee.paid ? 'Paid' : 'Unpaid'}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   {isIn ? (
-                    <div className="flex items-center gap-1.5 bg-gold/30 text-espresso text-sm font-semibold px-4 py-2.5 rounded-xl shrink-0">
+                    <button
+                      onClick={() => handleToggleCheckIn(attendee, false)}
+                      disabled={isToggling}
+                      className="flex items-center gap-1.5 bg-gold/30 hover:bg-gold/50 disabled:opacity-50 text-espresso text-sm font-semibold px-4 py-2.5 rounded-xl shrink-0 transition-colors"
+                    >
                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
                       </svg>
                       In
-                    </div>
+                    </button>
                   ) : (
                     <button
-                      onClick={() => handleCheckIn(attendee)}
-                      className="shrink-0 bg-terracotta hover:bg-rust active:scale-95 text-cream text-sm font-semibold px-5 py-2.5 rounded-xl transition-transform"
+                      onClick={() => handleToggleCheckIn(attendee, true)}
+                      disabled={isToggling}
+                      className="shrink-0 bg-terracotta hover:bg-rust active:scale-95 disabled:opacity-50 text-cream text-sm font-semibold px-5 py-2.5 rounded-xl transition-transform"
                     >
                       Check In
                     </button>

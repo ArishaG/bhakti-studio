@@ -1,0 +1,83 @@
+import { createClient } from '@/lib/supabase/server'
+import { arketaCheckInReservation } from '@/lib/arketa'
+
+// ─── Route handler ────────────────────────────────────────────────────────────
+// Toggles an attendance's checked_in state. Checking someone in who came from
+// an Arketa reservation also pushes the check-in to Arketa (their API
+// supports this). There is no equivalent for Eventbrite (no public write
+// endpoint) or for un-checking on Arketa (no documented endpoint) — both are
+// local-only, and the caller is told which happened so the UI can react.
+
+export async function POST(req: Request) {
+  const supabase = await createClient()
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+  if (!user) return new Response('Unauthorized', { status: 401 })
+
+  const { attendanceId, checkedIn } = (await req.json()) as {
+    attendanceId: string
+    checkedIn: boolean
+  }
+  if (!attendanceId || typeof checkedIn !== 'boolean') {
+    return Response.json({ error: 'attendanceId and checkedIn are required' }, { status: 400 })
+  }
+
+  const { data: attendance, error: fetchErr } = await supabase
+    .from('attendances')
+    .select('id, person_id, event_instance_id, source, arketa_reservation_id')
+    .eq('id', attendanceId)
+    .single()
+  if (fetchErr) throw fetchErr
+
+  const { error: updErr } = await supabase
+    .from('attendances')
+    .update({
+      checked_in: checkedIn,
+      ...(checkedIn ? { checked_in_at: new Date().toISOString() } : {}),
+    })
+    .eq('id', attendanceId)
+  if (updErr) throw updErr
+
+  let arketaPushed = false
+  let arketaError: string | null = null
+  let needsEventbriteReminder = false
+
+  if (checkedIn) {
+    const { data: person } = await supabase
+      .from('people')
+      .select('event_count')
+      .eq('id', attendance.person_id)
+      .single()
+
+    await supabase
+      .from('people')
+      .update({
+        last_seen_at: new Date().toISOString(),
+        ...((person?.event_count ?? 0) >= 3 && { is_active: true }),
+      })
+      .eq('id', attendance.person_id)
+
+    if (attendance.source === 'arketa' && attendance.arketa_reservation_id) {
+      const { data: instance } = await supabase
+        .from('event_instances')
+        .select('arketa_id')
+        .eq('id', attendance.event_instance_id)
+        .single()
+
+      if (instance?.arketa_id) {
+        try {
+          await arketaCheckInReservation(instance.arketa_id, attendance.arketa_reservation_id)
+          arketaPushed = true
+        } catch (err) {
+          arketaError = err instanceof Error ? err.message : 'Unknown error'
+        }
+      }
+    } else if (attendance.source === 'eventbrite') {
+      needsEventbriteReminder = true
+    }
+  }
+
+  return Response.json({ ok: true, arketaPushed, arketaError, needsEventbriteReminder })
+}
