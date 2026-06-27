@@ -18,6 +18,7 @@ type FollowUpFlag = {
 
 type AttendanceSummary = {
   id: string
+  checked_in_at: string
   event_instances: { event_series: { name: string; tag: EventTag } } | null
 }
 
@@ -58,6 +59,14 @@ const TAG_STYLES: Record<EventTag, string> = {
   other: 'bg-parchment text-walnut',
 }
 
+function firstAttendanceDate(attendances: AttendanceSummary[]): string | null {
+  if (attendances.length === 0) return null
+  return attendances.reduce<string | null>(
+    (earliest, a) => (!earliest || a.checked_in_at < earliest ? a.checked_in_at : earliest),
+    null
+  )
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function ProfilesPage() {
@@ -96,7 +105,7 @@ export default function ProfilesPage() {
       .select(`
         id, name, email, phone, event_count, is_active, last_seen_at, admin_notes, created_at,
         follow_up_flags ( id, reason, created_at, assigned_to, notes, resolved ),
-        attendances ( id, event_instances ( event_series ( name, tag ) ) )
+        attendances ( id, checked_in_at, event_instances ( event_series ( name, tag ) ) )
       `)
       .order('name')
     setPeople((data as unknown as Person[]) ?? [])
@@ -275,6 +284,7 @@ export default function ProfilesPage() {
           .filter(Boolean) as EventTag[]
       ),
     ]
+    const firstAttended = firstAttendanceDate(selectedPerson.attendances)
 
     return (
       <div className="min-h-screen bg-cream pt-16">
@@ -318,6 +328,16 @@ export default function ProfilesPage() {
                 <span className="text-sm text-walnut">
                   Last seen{' '}
                   {new Date(selectedPerson.last_seen_at).toLocaleDateString('en-US', {
+                    month: 'short',
+                    day: 'numeric',
+                    year: 'numeric',
+                  })}
+                </span>
+              )}
+              {firstAttended && (
+                <span className="text-sm text-walnut">
+                  First attended{' '}
+                  {new Date(firstAttended).toLocaleDateString('en-US', {
                     month: 'short',
                     day: 'numeric',
                     year: 'numeric',
@@ -553,8 +573,8 @@ export default function ProfilesPage() {
         </div>
       </div>
 
-      {/* List */}
-      <div className="px-4 pt-3 pb-10">
+      {/* Grid */}
+      <div className="px-4 pt-3 pb-10 max-w-6xl mx-auto">
         {loading ? (
           <Spinner />
         ) : displayedPeople.length === 0 ? (
@@ -564,7 +584,7 @@ export default function ProfilesPage() {
             </p>
           </div>
         ) : (
-          <ul className="space-y-3 max-w-2xl mx-auto">
+          <ul className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {displayedPeople.map(person => {
               const tags = [
                 ...new Set(
@@ -574,12 +594,13 @@ export default function ProfilesPage() {
                 ),
               ]
               const unresolvedFlags = person.follow_up_flags.filter(f => !f.resolved)
+              const firstAttended = firstAttendanceDate(person.attendances)
 
               return (
                 <li key={person.id}>
                   <button
                     onClick={() => openDetail(person)}
-                    className="w-full text-left bg-parchment rounded-2xl p-5 shadow-sm active:scale-[0.99] transition-transform"
+                    className="w-full h-full text-left bg-parchment rounded-2xl p-5 shadow-sm active:scale-[0.99] transition-transform flex flex-col"
                   >
                     {/* Name + active badge */}
                     <div className="flex items-start justify-between gap-3 mb-2">
@@ -599,7 +620,7 @@ export default function ProfilesPage() {
 
                     {/* Contact */}
                     <div className="text-sm text-walnut space-y-0.5 mb-2">
-                      {person.email && <p>{person.email}</p>}
+                      {person.email && <p className="truncate">{person.email}</p>}
                       {person.phone && <p>{person.phone}</p>}
                     </div>
 
@@ -610,6 +631,16 @@ export default function ProfilesPage() {
                         <span>
                           Last seen{' '}
                           {new Date(person.last_seen_at).toLocaleDateString('en-US', {
+                            month: 'short',
+                            day: 'numeric',
+                            year: 'numeric',
+                          })}
+                        </span>
+                      )}
+                      {firstAttended && (
+                        <span>
+                          First attended{' '}
+                          {new Date(firstAttended).toLocaleDateString('en-US', {
                             month: 'short',
                             day: 'numeric',
                             year: 'numeric',

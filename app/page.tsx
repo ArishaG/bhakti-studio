@@ -260,7 +260,7 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen bg-cream pt-16">
-      <div className="max-w-4xl mx-auto px-4 pt-6 pb-16 space-y-8">
+      <div className="max-w-6xl mx-auto px-4 pt-6 pb-16 space-y-8">
 
         {/* ── Stat Bar ── */}
         <section>
@@ -329,7 +329,7 @@ export default function HomePage() {
                 aria-label="Next month"
               >
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7 7" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                 </svg>
               </button>
             </div>
@@ -354,7 +354,7 @@ export default function HomePage() {
               <div className="grid grid-cols-7">
                 {calendarCells.map((day, i) => {
                   if (!day) {
-                    return <div key={`empty-${i}`} className="border-b border-r border-cream/60 min-h-[4rem]" />
+                    return <div key={`empty-${i}`} className="border-b border-r border-cream/60 min-h-[9rem]" />
                   }
                   const key = toDateKey(day)
                   const dayEvents = eventsByDate[key] ?? []
@@ -364,12 +364,12 @@ export default function HomePage() {
                   return (
                     <div
                       key={key}
-                      className={`border-b border-r border-cream/60 min-h-[4rem] p-1.5 ${
+                      className={`border-b border-r border-cream/60 min-h-[9rem] p-2 ${
                         isPast ? 'opacity-50' : ''
                       }`}
                     >
                       <span
-                        className={`text-xs font-medium block mb-1 w-5 h-5 flex items-center justify-center rounded-full ${
+                        className={`text-xs font-medium block mb-1.5 w-5 h-5 flex items-center justify-center rounded-full ${
                           isToday
                             ? 'bg-terracotta text-cream'
                             : 'text-walnut'
@@ -377,13 +377,13 @@ export default function HomePage() {
                       >
                         {day.getDate()}
                       </span>
-                      <div className="space-y-0.5">
-                        {dayEvents.slice(0, 2).map(evt => (
+                      <div className="space-y-1">
+                        {dayEvents.slice(0, 3).map(evt => (
                           <CalEventPill key={evt.id} evt={evt} />
                         ))}
-                        {dayEvents.length > 2 && (
+                        {dayEvents.length > 3 && (
                           <p className="text-[10px] text-walnut/60 pl-0.5">
-                            +{dayEvents.length - 2} more
+                            +{dayEvents.length - 3} more
                           </p>
                         )}
                       </div>
@@ -507,15 +507,20 @@ function StatCard({
 function CalEventPill({ evt }: { evt: CalEvent }) {
   const tag = evt.series.tag as EventTag
   return (
-    <div className={`flex items-center gap-1 rounded px-1 py-0.5 ${TAG_STYLES[tag] ?? TAG_STYLES.other}`}>
-      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${TAG_DOT[tag] ?? TAG_DOT.other}`} />
-      <span className="text-[10px] font-medium leading-tight truncate">
-        {evt.series.name.length > 8 ? evt.series.name.slice(0, 7) + '…' : evt.series.name}
-        {evt.instructor_name && (
-          <span className="opacity-60"> · {evt.instructor_name.split(' ')[0]}</span>
-        )}
-      </span>
-    </div>
+    <Link
+      href={`/check-in?event=${evt.id}`}
+      className={`block rounded px-1.5 py-1 hover:brightness-95 transition-[filter] ${TAG_STYLES[tag] ?? TAG_STYLES.other}`}
+    >
+      <div className="flex items-start gap-1">
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 mt-1 ${TAG_DOT[tag] ?? TAG_DOT.other}`} />
+        <span className="text-[11px] font-medium leading-snug break-words">
+          {evt.series.name}
+          {evt.instructor_name && (
+            <span className="opacity-60"> · {evt.instructor_name.split(' ')[0]}</span>
+          )}
+        </span>
+      </div>
+    </Link>
   )
 }
 

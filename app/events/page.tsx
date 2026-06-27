@@ -244,7 +244,7 @@ export default function EventsPage() {
     () =>
       stats
         .filter(s => !s.isArchived)
-        .sort((a, b) => b.returnRate - a.returnRate),
+        .sort((a, b) => b.totalAttendances - a.totalAttendances),
     [stats]
   )
 
@@ -256,7 +256,7 @@ export default function EventsPage() {
         <div className="flex items-center justify-between mb-3">
           <h1 className="text-2xl font-bold text-espresso">Events</h1>
           <span className="text-xs text-walnut bg-parchment px-3 py-1.5 rounded-full">
-            Sorted by return rate
+            Sorted by total attendance
           </span>
         </div>
 

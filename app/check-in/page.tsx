@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { Suspense, useState, useEffect, useMemo, useRef } from 'react'
+import { useSearchParams } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -11,8 +12,16 @@ type AttendanceSource = 'eventbrite' | 'arketa' | 'manual'
 type EventWithSeries = {
   id: string
   date: string
+  series_id: string
   instructor_name: string | null
   series: { name: string; tag: EventTag }
+}
+
+type SeriesGroup = {
+  id: string
+  name: string
+  tag: EventTag
+  events: EventWithSeries[]
 }
 
 type AttendeeRecord = {
@@ -40,7 +49,16 @@ const TAG_STYLES: Record<EventTag, string> = {
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function CheckInPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-cream pt-16" />}>
+      <CheckInPageInner />
+    </Suspense>
+  )
+}
+
+function CheckInPageInner() {
   const supabase = createClient()
+  const searchParams = useSearchParams()
 
   const [view, setView] = useState<'events' | 'attendees'>('events')
   const [events, setEvents] = useState<EventWithSeries[]>([])
@@ -50,28 +68,68 @@ export default function CheckInPage() {
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [showAddModal, setShowAddModal] = useState(false)
+  const [expandedSeries, setExpandedSeries] = useState<Set<string>>(new Set())
+  const deepLinkHandled = useRef(false)
 
   useEffect(() => {
     loadEvents()
   }, [])
 
+  // Deep link from the dashboard calendar: ?event=<id> jumps straight to that
+  // event's attendee view once the full event list has loaded.
+  useEffect(() => {
+    if (deepLinkHandled.current || events.length === 0) return
+    const eventId = searchParams.get('event')
+    if (!eventId) return
+    const found = events.find(e => e.id === eventId)
+    if (found) {
+      deepLinkHandled.current = true
+      selectEvent(found)
+    }
+  }, [events, searchParams])
+
   async function loadEvents() {
     setLoading(true)
-    const start = new Date()
-    start.setHours(0, 0, 0, 0)
-    const end = new Date(start)
-    end.setDate(end.getDate() + 1)
-
     const { data } = await supabase
       .from('event_instances')
       .select('*, series:event_series(name, tag)')
-      .gte('date', start.toISOString())
-      .lt('date', end.toISOString())
-      .order('date')
+      .order('date', { ascending: false })
 
     setEvents((data as EventWithSeries[]) ?? [])
     setLoading(false)
   }
+
+  function toggleSeries(seriesId: string) {
+    setExpandedSeries(prev => {
+      const next = new Set(prev)
+      next.has(seriesId) ? next.delete(seriesId) : next.add(seriesId)
+      return next
+    })
+  }
+
+  const todayEvents = useMemo(() => {
+    const start = new Date()
+    start.setHours(0, 0, 0, 0)
+    const end = new Date(start)
+    end.setDate(end.getDate() + 1)
+    return events
+      .filter(e => {
+        const d = new Date(e.date)
+        return d >= start && d < end
+      })
+      .sort((a, b) => a.date.localeCompare(b.date))
+  }, [events])
+
+  const seriesGroups = useMemo<SeriesGroup[]>(() => {
+    const map = new Map<string, SeriesGroup>()
+    for (const e of events) {
+      if (!map.has(e.series_id)) {
+        map.set(e.series_id, { id: e.series_id, name: e.series.name, tag: e.series.tag, events: [] })
+      }
+      map.get(e.series_id)!.events.push(e)
+    }
+    return [...map.values()].sort((a, b) => b.events.length - a.events.length)
+  }, [events])
 
   async function loadAttendees(event: EventWithSeries) {
     setLoading(true)
@@ -219,7 +277,7 @@ export default function CheckInPage() {
     return (
       <div className="min-h-screen bg-cream pt-16">
         <div className="px-4 pt-6 pb-4">
-          <h1 className="text-2xl font-bold text-espresso">Today&apos;s Events</h1>
+          <h1 className="text-2xl font-bold text-espresso">Check-In</h1>
           <p className="text-walnut text-sm mt-1">
             {new Date().toLocaleDateString('en-US', {
               weekday: 'long',
@@ -233,45 +291,77 @@ export default function CheckInPage() {
           <Spinner />
         ) : events.length === 0 ? (
           <div className="px-4 py-16 text-center">
-            <p className="text-walnut text-lg">No events scheduled for today.</p>
+            <p className="text-walnut text-lg">No events found.</p>
           </div>
         ) : (
-          <ul className="px-4 space-y-3 pb-10">
-            {events.map(event => (
-              <li key={event.id}>
-                <button
-                  onClick={() => selectEvent(event)}
-                  className="w-full text-left bg-parchment rounded-2xl p-5 shadow-sm active:scale-[0.98] transition-transform"
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex-1 min-w-0">
-                      <h2 className="text-xl font-semibold text-espresso">
-                        {event.series.name}
-                      </h2>
-                      {event.instructor_name && (
-                        <p className="text-walnut text-sm mt-0.5">
-                          with {event.instructor_name}
-                        </p>
+          <div className="px-4 pb-10 space-y-8">
+            {/* Today */}
+            <section>
+              <h2 className="text-base font-semibold text-espresso mb-3">
+                Today {todayEvents.length > 0 && <span className="font-normal text-walnut">({todayEvents.length})</span>}
+              </h2>
+              {todayEvents.length === 0 ? (
+                <p className="text-walnut text-sm bg-parchment rounded-2xl px-4 py-4">
+                  No events scheduled for today.
+                </p>
+              ) : (
+                <ul className="space-y-3">
+                  {todayEvents.map(event => (
+                    <li key={event.id}>
+                      <EventCard event={event} onClick={() => selectEvent(event)} />
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            {/* All events, grouped by series */}
+            <section>
+              <h2 className="text-base font-semibold text-espresso mb-3">All Events</h2>
+              <ul className="space-y-2">
+                {seriesGroups.map(group => {
+                  const isOpen = expandedSeries.has(group.id)
+                  return (
+                    <li key={group.id} className="bg-parchment rounded-2xl overflow-hidden">
+                      <button
+                        onClick={() => toggleSeries(group.id)}
+                        className="w-full flex items-center justify-between gap-3 px-4 py-3.5 text-left"
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <svg
+                            className={`w-4 h-4 text-walnut shrink-0 transition-transform ${isOpen ? 'rotate-90' : ''}`}
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                          </svg>
+                          <span className="font-semibold text-espresso truncate">{group.name}</span>
+                          <span
+                            className={`shrink-0 text-xs font-semibold px-2.5 py-0.5 rounded-full capitalize ${
+                              TAG_STYLES[group.tag] ?? TAG_STYLES.other
+                            }`}
+                          >
+                            {group.tag}
+                          </span>
+                        </div>
+                        <span className="shrink-0 text-sm text-walnut">{group.events.length}</span>
+                      </button>
+                      {isOpen && (
+                        <ul className="px-3 pb-3 space-y-2">
+                          {group.events.map(event => (
+                            <li key={event.id}>
+                              <EventCard event={event} onClick={() => selectEvent(event)} compact />
+                            </li>
+                          ))}
+                        </ul>
                       )}
-                      <p className="text-walnut text-sm mt-1">
-                        {new Date(event.date).toLocaleTimeString('en-US', {
-                          hour: 'numeric',
-                          minute: '2-digit',
-                        })}
-                      </p>
-                    </div>
-                    <span
-                      className={`shrink-0 text-xs font-semibold px-3 py-1 rounded-full capitalize ${
-                        TAG_STYLES[event.series.tag] ?? TAG_STYLES.other
-                      }`}
-                    >
-                      {event.series.tag}
-                    </span>
-                  </div>
-                </button>
-              </li>
-            ))}
-          </ul>
+                    </li>
+                  )
+                })}
+              </ul>
+            </section>
+          </div>
         )}
       </div>
     )
@@ -550,5 +640,57 @@ function Spinner() {
     <div className="flex items-center justify-center py-20">
       <div className="w-8 h-8 border-2 border-terracotta border-t-transparent rounded-full animate-spin" />
     </div>
+  )
+}
+
+function EventCard({
+  event,
+  onClick,
+  compact,
+}: {
+  event: EventWithSeries
+  onClick: () => void
+  compact?: boolean
+}) {
+  const dateLabel = new Date(event.date).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  })
+  const timeLabel = new Date(event.date).toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left rounded-2xl shadow-sm active:scale-[0.98] transition-transform ${
+        compact ? 'bg-cream p-4' : 'bg-parchment p-5'
+      }`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          {!compact && (
+            <h2 className="text-xl font-semibold text-espresso">{event.series.name}</h2>
+          )}
+          {event.instructor_name && (
+            <p className="text-walnut text-sm mt-0.5">with {event.instructor_name}</p>
+          )}
+          <p className="text-walnut text-sm mt-1">
+            {compact ? `${dateLabel} · ${timeLabel}` : timeLabel}
+          </p>
+        </div>
+        {!compact && (
+          <span
+            className={`shrink-0 text-xs font-semibold px-3 py-1 rounded-full capitalize ${
+              TAG_STYLES[event.series.tag] ?? TAG_STYLES.other
+            }`}
+          >
+            {event.series.tag}
+          </span>
+        )}
+      </div>
+    </button>
   )
 }
