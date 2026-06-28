@@ -33,6 +33,15 @@ type AttendanceDetail = {
   } | null
 }
 
+type Assessment = {
+  id: string
+  rating: number | null
+  notes: string | null
+  created_at: string
+  updated_at: string
+  event_instances: { date: string; event_series: { name: string; tag: EventTag } } | null
+}
+
 type Person = {
   id: string
   name: string
@@ -45,6 +54,7 @@ type Person = {
   created_at: string
   follow_up_flags: FollowUpFlag[]
   attendances: AttendanceSummary[]
+  member_assessments: Assessment[]
 }
 
 type SortMode = 'followUp' | 'mostRegular' | 'leastRegular'
@@ -64,6 +74,12 @@ function firstAttendanceDate(attendances: AttendanceSummary[]): string | null {
   return attendances.reduce<string | null>(
     (earliest, a) => (!earliest || a.checked_in_at < earliest ? a.checked_in_at : earliest),
     null
+  )
+}
+
+function sortedAssessments(assessments: Assessment[]): Assessment[] {
+  return [...assessments].sort((a, b) =>
+    (b.event_instances?.date ?? b.created_at).localeCompare(a.event_instances?.date ?? a.created_at)
   )
 }
 
@@ -105,7 +121,8 @@ export default function ProfilesPage() {
       .select(`
         id, name, email, phone, event_count, is_active, last_seen_at, admin_notes, created_at,
         follow_up_flags ( id, reason, created_at, assigned_to, notes, resolved ),
-        attendances ( id, checked_in_at, event_instances ( event_series ( name, tag ) ) )
+        attendances ( id, checked_in_at, event_instances ( event_series ( name, tag ) ) ),
+        member_assessments ( id, rating, notes, created_at, updated_at, event_instances ( date, event_series ( name, tag ) ) )
       `)
       .order('name')
     setPeople((data as unknown as Person[]) ?? [])
@@ -496,6 +513,14 @@ export default function ProfilesPage() {
             )}
           </section>
 
+          {/* Conduciveness (Soulfest review history) */}
+          {selectedPerson.member_assessments.length > 0 && (
+            <section>
+              <h3 className="text-base font-semibold text-espresso mb-3">Conduciveness</h3>
+              <ConduciveSection assessments={selectedPerson.member_assessments} />
+            </section>
+          )}
+
           {/* Resolved flags (collapsed section) */}
           {resolvedFlags.length > 0 && (
             <section>
@@ -595,6 +620,9 @@ export default function ProfilesPage() {
               ]
               const unresolvedFlags = person.follow_up_flags.filter(f => !f.resolved)
               const firstAttended = firstAttendanceDate(person.attendances)
+              const latestAssessment = sortedAssessments(person.member_assessments).find(
+                a => a.rating !== null
+              )
 
               return (
                 <li key={person.id}>
@@ -602,20 +630,27 @@ export default function ProfilesPage() {
                     onClick={() => openDetail(person)}
                     className="w-full h-full text-left bg-parchment rounded-2xl p-5 shadow-sm active:scale-[0.99] transition-transform flex flex-col"
                   >
-                    {/* Name + active badge */}
+                    {/* Name + badges */}
                     <div className="flex items-start justify-between gap-3 mb-2">
                       <h3 className="text-lg font-semibold text-espresso leading-tight">
                         {person.name}
                       </h3>
-                      <span
-                        className={`shrink-0 text-xs font-semibold px-2.5 py-1 rounded-full ${
-                          person.is_active
-                            ? 'bg-gold/40 text-espresso'
-                            : 'bg-walnut/20 text-walnut'
-                        }`}
-                      >
-                        {person.is_active ? 'Active' : 'Inactive'}
-                      </span>
+                      <div className="shrink-0 flex flex-col items-end gap-1">
+                        <span
+                          className={`text-xs font-semibold px-2.5 py-1 rounded-full ${
+                            person.is_active
+                              ? 'bg-gold/40 text-espresso'
+                              : 'bg-walnut/20 text-walnut'
+                          }`}
+                        >
+                          {person.is_active ? 'Active' : 'Inactive'}
+                        </span>
+                        {latestAssessment && (
+                          <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-terracotta/15 text-terracotta">
+                            Conduciveness {latestAssessment.rating}/5
+                          </span>
+                        )}
+                      </div>
                     </div>
 
                     {/* Contact */}
@@ -809,6 +844,81 @@ function FlagCard({
         )}
       </div>
     </div>
+  )
+}
+
+// ─── Conduciveness ────────────────────────────────────────────────────────────
+
+function ConduciveSection({ assessments }: { assessments: Assessment[] }) {
+  const [expanded, setExpanded] = useState(false)
+  const sorted = useMemo(() => sortedAssessments(assessments), [assessments])
+  const rated = sorted.filter(a => a.rating !== null)
+  const trend = [...rated].reverse().map(a => a.rating)
+  const visible = sorted.slice(0, 2)
+  const rest = sorted.slice(2)
+
+  return (
+    <div className="bg-parchment rounded-2xl p-5 space-y-3">
+      {rated.length > 0 && (
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="text-2xl font-bold text-espresso">{rated[0].rating}/5</span>
+          {trend.length > 1 && (
+            <span className="text-sm text-walnut">Trend: {trend.join(' → ')}</span>
+          )}
+        </div>
+      )}
+      <ul className="space-y-2">
+        {visible.map(a => (
+          <AssessmentRow key={a.id} a={a} />
+        ))}
+      </ul>
+      {rest.length > 0 && (
+        <>
+          {expanded && (
+            <ul className="space-y-2 border-t border-cream/80 pt-2">
+              {rest.map(a => (
+                <AssessmentRow key={a.id} a={a} />
+              ))}
+            </ul>
+          )}
+          <button
+            onClick={() => setExpanded(o => !o)}
+            className="text-xs font-medium text-terracotta"
+          >
+            {expanded ? 'Hide full history' : `Full history (${sorted.length})`}
+          </button>
+        </>
+      )}
+    </div>
+  )
+}
+
+function AssessmentRow({ a }: { a: Assessment }) {
+  return (
+    <li className="bg-cream rounded-xl px-4 py-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-sm font-medium text-espresso truncate">
+          {a.event_instances?.event_series?.name ?? 'Soulfest'}
+          {a.event_instances?.date && (
+            <span className="font-normal text-walnut">
+              {' '}
+              ·{' '}
+              {new Date(a.event_instances.date).toLocaleDateString('en-US', {
+                month: 'short',
+                day: 'numeric',
+                year: 'numeric',
+              })}
+            </span>
+          )}
+        </p>
+        {a.rating !== null && (
+          <span className="shrink-0 text-xs font-semibold px-2 py-0.5 rounded-full bg-terracotta/15 text-terracotta">
+            {a.rating}/5
+          </span>
+        )}
+      </div>
+      {a.notes && <p className="text-xs text-walnut mt-1 leading-relaxed">{a.notes}</p>}
+    </li>
   )
 }
 

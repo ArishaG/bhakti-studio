@@ -1,15 +1,19 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { eventbriteFetchAllEvents, eventbriteFetchAllAttendees } from '@/lib/eventbrite'
+import { canonicalSeriesName, classifySeries } from '@/lib/eventTagging'
 
-// Events are matched to existing event_instances (imported from Arketa) by
-// exact start-time match — Eventbrite is only used here as a second source of
-// attendance/check-in data for events that already exist on the calendar, not
-// as a source of new events.
+// Events are first matched to existing event_instances (usually imported
+// from Arketa) by exact/near start-time match, so Eventbrite acts as a
+// second source of attendance/check-in data for events that already exist
+// on the calendar. For events with no match anywhere (e.g. anything from
+// before the studio adopted Arketa in Nov 2025), Eventbrite is the only
+// source of truth, so a new event_series/event_instance is created for them
+// here instead of dropping the attendance data.
 const MATCH_TOLERANCE_MS = 3 * 60 * 1000
 
 export type EventbriteSyncResult = {
   eventsMatched: number
-  eventsUnmatched: number
+  eventsCreated: number
   attendees: { checkedIn: number; registered: number; skippedCancelled: number }
   peopleCreated: number
   attendancesCreated: number
@@ -17,7 +21,8 @@ export type EventbriteSyncResult = {
   attendancesSkipped: number
 }
 
-// Idempotent: matches existing instances by exact/near start time, attendees
+// Idempotent: matches existing instances by eventbrite_id (from a prior run
+// of this same backfill) or exact/near start time (from Arketa), attendees
 // by eventbrite_attendee_id (so re-running this updates checked_in/paid
 // status instead of just skipping), so it's safe to re-run from a button, a
 // cron job, or a webhook-triggered refresh.
@@ -33,24 +38,43 @@ export async function syncEventbrite(
   else cutoff.setMonth(cutoff.getMonth() - sinceMonthsAgo)
 
   const events = allEvents.filter(
-    e => e.status !== 'canceled' && new Date(e.start.utc) >= cutoff
+    e => e.status !== 'canceled' && e.status !== 'draft' && new Date(e.start.utc) >= cutoff
   )
 
-  const { data: instances } = await supabase.from('event_instances').select('id, date')
+  const { data: instances } = await supabase
+    .from('event_instances')
+    .select('id, date, eventbrite_id')
   const instanceList = instances ?? []
   const instanceByExactDate = new Map(instanceList.map(i => [i.date, i.id as string]))
+  const instanceByEventbriteId = new Map(
+    instanceList.filter(i => i.eventbrite_id).map(i => [i.eventbrite_id as string, i.id as string])
+  )
+
+  const { data: existingSeries } = await supabase.from('event_series').select('id, name')
+  const seriesIdByName = new Map((existingSeries ?? []).map(s => [s.name, s.id as string]))
 
   let eventsMatched = 0
-  let eventsUnmatched = 0
+  let eventsCreated = 0
   const matches: { eventId: string; instanceId: string }[] = []
 
   for (const e of events) {
+    // 1. previously-created instance from an earlier run of this backfill
+    const byEventbriteId = instanceByEventbriteId.get(e.id)
+    if (byEventbriteId) {
+      matches.push({ eventId: e.id, instanceId: byEventbriteId })
+      eventsMatched++
+      continue
+    }
+
+    // 2. exact start-time match against an existing instance (usually Arketa)
     const exact = instanceByExactDate.get(e.start.utc)
     if (exact) {
       matches.push({ eventId: e.id, instanceId: exact })
       eventsMatched++
       continue
     }
+
+    // 3. near-time match (clock skew between platforms)
     const evtTime = new Date(e.start.utc).getTime()
     let nearest: { id: string; diff: number } | null = null
     for (const inst of instanceList) {
@@ -62,9 +86,35 @@ export async function syncEventbrite(
     if (nearest) {
       matches.push({ eventId: e.id, instanceId: nearest.id })
       eventsMatched++
-    } else {
-      eventsUnmatched++
+      continue
     }
+
+    // 4. no instance anywhere — Eventbrite is the only source for this
+    // event, so create its series (if needed) and instance now.
+    const seriesName = canonicalSeriesName(e.name.text)
+    let seriesId = seriesIdByName.get(seriesName)
+    if (!seriesId) {
+      const { data: newSeries, error } = await supabase
+        .from('event_series')
+        .insert({ name: seriesName, tag: classifySeries(seriesName) })
+        .select('id')
+        .single()
+      if (error) throw error
+      seriesId = newSeries.id
+      seriesIdByName.set(seriesName, seriesId!)
+    }
+
+    const { data: newInstance, error: instErr } = await supabase
+      .from('event_instances')
+      .insert({ series_id: seriesId, date: e.start.utc, eventbrite_id: e.id })
+      .select('id')
+      .single()
+    if (instErr) throw instErr
+
+    matches.push({ eventId: e.id, instanceId: newInstance.id })
+    instanceByEventbriteId.set(e.id, newInstance.id)
+    eventsCreated++
+    eventsMatched++
   }
 
   let checkedIn = 0
@@ -155,7 +205,7 @@ export async function syncEventbrite(
 
   return {
     eventsMatched,
-    eventsUnmatched,
+    eventsCreated,
     attendees: { checkedIn, registered, skippedCancelled },
     peopleCreated,
     attendancesCreated,

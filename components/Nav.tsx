@@ -10,6 +10,7 @@ const links = [
   { href: '/profiles', label: 'Profiles' },
   { href: '/events', label: 'Events' },
   { href: '/check-in', label: 'Check-In' },
+  { href: '/review', label: 'Review' },
 ]
 
 export default function Nav() {
