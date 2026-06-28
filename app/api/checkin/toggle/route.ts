@@ -1,12 +1,16 @@
 import { createClient } from '@/lib/supabase/server'
 import { arketaCheckInReservation } from '@/lib/arketa'
+import { pushEventbriteCheckIn } from '@/lib/eventbriteCheckinBot'
 
 // ─── Route handler ────────────────────────────────────────────────────────────
 // Toggles an attendance's checked_in state. Checking someone in who came from
 // an Arketa reservation also pushes the check-in to Arketa (their API
-// supports this). There is no equivalent for Eventbrite (no public write
-// endpoint) or for un-checking on Arketa (no documented endpoint) — both are
-// local-only, and the caller is told which happened so the UI can react.
+// supports this); checking in someone from Eventbrite pushes to the
+// eventbrite-checkin-bot service instead (Eventbrite has no public write
+// endpoint, so that bot drives a real browser against their organizer UI).
+// Un-checking on Arketa has no documented endpoint and stays local-only.
+// Both pushes are best-effort, and the caller is told which happened so the
+// UI can show a fallback reminder if either fails.
 
 export async function POST(req: Request) {
   const supabase = await createClient()
@@ -42,7 +46,8 @@ export async function POST(req: Request) {
 
   let arketaPushed = false
   let arketaError: string | null = null
-  let needsEventbriteReminder = false
+  let eventbritePushed = false
+  let eventbriteError: string | null = null
 
   if (checkedIn) {
     const { data: person } = await supabase
@@ -75,9 +80,30 @@ export async function POST(req: Request) {
         }
       }
     } else if (attendance.source === 'eventbrite') {
-      needsEventbriteReminder = true
+      const { data: instance } = await supabase
+        .from('event_instances')
+        .select('eventbrite_id')
+        .eq('id', attendance.event_instance_id)
+        .single()
+
+      if (instance?.eventbrite_id) {
+        const { data: personRow } = await supabase
+          .from('people')
+          .select('name, email')
+          .eq('id', attendance.person_id)
+          .single()
+
+        if (personRow) {
+          try {
+            await pushEventbriteCheckIn(instance.eventbrite_id, personRow.email, personRow.name)
+            eventbritePushed = true
+          } catch (err) {
+            eventbriteError = err instanceof Error ? err.message : 'Unknown error'
+          }
+        }
+      }
     }
   }
 
-  return Response.json({ ok: true, arketaPushed, arketaError, needsEventbriteReminder })
+  return Response.json({ ok: true, arketaPushed, arketaError, eventbritePushed, eventbriteError })
 }

@@ -167,9 +167,10 @@ function CheckInPageInner() {
   }
 
   // Toggle check-in state for a pre-registered attendee. Checking in someone
-  // from an Arketa reservation also pushes the check-in to Arketa; there's
-  // no equivalent for Eventbrite (shows a manual reminder instead) or for
-  // un-checking on Arketa (no documented endpoint — local-only).
+  // from an Arketa reservation pushes the check-in to Arketa; checking in
+  // someone from Eventbrite pushes it via the eventbrite-checkin-bot service.
+  // Both are best-effort — a reminder shows only if the push failed. Un-
+  // checking on Arketa has no documented endpoint and stays local-only.
   async function handleToggleCheckIn(attendee: AttendeeRecord, checkedIn: boolean) {
     setTogglingIds(prev => new Set([...prev, attendee.id]))
     setAttendees(prev =>
@@ -184,8 +185,8 @@ function CheckInPageInner() {
       })
       if (res.ok) {
         const result = await res.json()
-        if (result.needsEventbriteReminder) {
-          setReminder(`Also check in ${attendee.person.name} in the Eventbrite app`)
+        if (attendee.source === 'eventbrite' && checkedIn && !result.eventbritePushed) {
+          setReminder(`Checked in locally, but couldn't sync to Eventbrite for ${attendee.person.name} — check them in there manually`)
           setTimeout(() => setReminder(null), 6000)
         } else if (attendee.source === 'arketa' && checkedIn && !result.arketaPushed) {
           setReminder(`Checked in locally, but couldn't sync to Arketa for ${attendee.person.name}`)
