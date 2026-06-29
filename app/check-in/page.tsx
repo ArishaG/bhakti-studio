@@ -166,11 +166,12 @@ function CheckInPageInner() {
     setRefreshing(false)
   }
 
-  // Toggle check-in state for a pre-registered attendee. Checking in someone
-  // from an Arketa reservation pushes the check-in to Arketa; checking in
-  // someone from Eventbrite pushes it via the eventbrite-checkin-bot service.
-  // Both are best-effort — a reminder shows only if the push failed. Un-
-  // checking on Arketa has no documented endpoint and stays local-only.
+  // Toggle check-in state for a pre-registered attendee. Eventbrite
+  // attendees push both checking in and un-checking via the
+  // eventbrite-checkin-bot service, since it can click either "Check in" or
+  // "Undo check-in" on the row. Arketa attendees only push on check-in —
+  // un-checking on Arketa has no documented endpoint and stays local-only.
+  // Both pushes are best-effort — a reminder shows only if the push failed.
   async function handleToggleCheckIn(attendee: AttendeeRecord, checkedIn: boolean) {
     setTogglingIds(prev => new Set([...prev, attendee.id]))
     setAttendees(prev =>
@@ -185,8 +186,9 @@ function CheckInPageInner() {
       })
       if (res.ok) {
         const result = await res.json()
-        if (attendee.source === 'eventbrite' && checkedIn && !result.eventbritePushed) {
-          setReminder(`Checked in locally, but couldn't sync to Eventbrite for ${attendee.person.name} — check them in there manually`)
+        if (attendee.source === 'eventbrite' && !result.eventbritePushed) {
+          const action = checkedIn ? 'check them in' : 'undo their check-in'
+          setReminder(`${checkedIn ? 'Checked in' : 'Unchecked'} locally, but couldn't sync to Eventbrite for ${attendee.person.name} — ${action} there manually`)
           setTimeout(() => setReminder(null), 6000)
         } else if (attendee.source === 'arketa' && checkedIn && !result.arketaPushed) {
           setReminder(`Checked in locally, but couldn't sync to Arketa for ${attendee.person.name}`)

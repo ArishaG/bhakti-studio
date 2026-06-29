@@ -1,4 +1,7 @@
-FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+# This tag's version must exactly match the "playwright" version pinned in
+# package.json — the image only ships browser binaries for that one version,
+# and a mismatch fails every check-in with "Executable doesn't exist".
+FROM mcr.microsoft.com/playwright:v1.61.1-jammy
 
 WORKDIR /app
 

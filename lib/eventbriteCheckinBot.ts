@@ -1,12 +1,13 @@
 // Calls the separate eventbrite-checkin-bot service (see
 // /eventbrite-checkin-bot), which drives a real browser against Eventbrite's
 // organizer UI — there's no public API for writing check-in status, so this
-// is the only way to reflect a local check-in on Eventbrite's side. Best-
-// effort: callers should not fail the local check-in if this throws.
+// is the only way to reflect a local check-in (or un-check) on Eventbrite's
+// side. Best-effort: callers should not fail the local update if this throws.
 export async function pushEventbriteCheckIn(
   eventbriteEventId: string,
   attendeeEmail: string | null,
-  attendeeName: string
+  attendeeName: string,
+  checkedIn: boolean
 ): Promise<void> {
   const baseUrl = process.env.EVENTBRITE_CHECKIN_BOT_URL
   if (!baseUrl) throw new Error('EVENTBRITE_CHECKIN_BOT_URL is not configured')
@@ -17,7 +18,7 @@ export async function pushEventbriteCheckIn(
       'Content-Type': 'application/json',
       Authorization: `Bearer ${process.env.EVENTBRITE_CHECKIN_BOT_SECRET}`,
     },
-    body: JSON.stringify({ eventbriteEventId, attendeeEmail, attendeeName }),
+    body: JSON.stringify({ eventbriteEventId, attendeeEmail, attendeeName, checkedIn }),
   })
 
   const body = await res.json().catch(() => null)

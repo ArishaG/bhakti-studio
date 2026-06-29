@@ -15,15 +15,18 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
 app.post('/check-in', requireAuth, async (req, res) => {
-  const { eventbriteEventId, attendeeEmail, attendeeName } = req.body ?? {}
-  if (!eventbriteEventId || !attendeeName) {
-    res.status(400).json({ ok: false, error: 'eventbriteEventId and attendeeName are required' })
+  const { eventbriteEventId, attendeeEmail, attendeeName, checkedIn } = req.body ?? {}
+  if (!eventbriteEventId || !attendeeName || typeof checkedIn !== 'boolean') {
+    res
+      .status(400)
+      .json({ ok: false, error: 'eventbriteEventId, attendeeName, and checkedIn are required' })
     return
   }
   const result = await performEventbriteCheckIn({
     eventbriteEventId,
     attendeeEmail: attendeeEmail ?? null,
     attendeeName,
+    checkedIn,
   })
   res.json(result)
 })
