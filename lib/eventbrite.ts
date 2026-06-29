@@ -24,6 +24,7 @@ export type EBAttendee = {
   changed: string
   event_id: string
   costs: { gross: { value: number } }
+  ticket_class_name: string | null
 }
 
 async function eventbriteGet<T>(path: string): Promise<T> {

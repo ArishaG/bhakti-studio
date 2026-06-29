@@ -21,16 +21,172 @@ export type EventbriteSyncResult = {
   attendancesSkipped: number
 }
 
+type AttendeeStats = {
+  checkedIn: number
+  registered: number
+  skippedCancelled: number
+  peopleCreated: number
+  attendancesCreated: number
+  attendancesUpdated: number
+  attendancesSkipped: number
+}
+
+function emptyStats(): AttendeeStats {
+  return {
+    checkedIn: 0,
+    registered: 0,
+    skippedCancelled: 0,
+    peopleCreated: 0,
+    attendancesCreated: 0,
+    attendancesUpdated: 0,
+    attendancesSkipped: 0,
+  }
+}
+
+// Pulls one event's attendees and upserts them into people / attendances.
+// Pulled out so the single-event refresh path (below) can sync just one
+// event's attendees without paying for a full org-wide events/attendees crawl.
+async function syncEventAttendees(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: SupabaseClient<any, any, any>,
+  eventId: string,
+  instanceId: string,
+  personIdByEmail: Map<string, string>,
+  stats: AttendeeStats
+): Promise<void> {
+  const attendees = await eventbriteFetchAllAttendees(eventId)
+
+  for (const a of attendees) {
+    if (a.cancelled || a.refunded) {
+      stats.skippedCancelled++
+      continue
+    }
+    a.checked_in ? stats.checkedIn++ : stats.registered++
+
+    const email = a.profile.email?.trim().toLowerCase() || null
+    const fullName =
+      a.profile.name?.trim() ||
+      `${a.profile.first_name ?? ''} ${a.profile.last_name ?? ''}`.trim() ||
+      'Unknown'
+
+    let personId = email ? personIdByEmail.get(email) ?? null : null
+
+    if (!personId && email) {
+      const { data: existingPerson } = await supabase
+        .from('people')
+        .select('id')
+        .ilike('email', email)
+        .limit(1)
+        .maybeSingle()
+      personId = existingPerson?.id ?? null
+    }
+
+    if (!personId) {
+      const { data: newPerson, error } = await supabase
+        .from('people')
+        .insert(email ? { name: fullName, email } : { name: fullName })
+        .select('id')
+        .single()
+      if (error) throw error
+      personId = newPerson.id
+      stats.peopleCreated++
+    }
+
+    if (email) personIdByEmail.set(email, personId!)
+
+    const checkedInAt = a.checked_in ? a.changed || a.created : a.created
+    const paid = a.costs.gross.value > 0
+    const ticketType = a.ticket_class_name?.trim() || null
+
+    const { data: updated, error: updErr } = await supabase
+      .from('attendances')
+      .update({ checked_in: a.checked_in, checked_in_at: checkedInAt, paid, ticket_type: ticketType })
+      .eq('eventbrite_attendee_id', a.id)
+      .select('id')
+    if (updErr) throw updErr
+
+    if (updated && updated.length > 0) {
+      stats.attendancesUpdated++
+      continue
+    }
+
+    const { error: attErr } = await supabase.from('attendances').insert({
+      person_id: personId!,
+      event_instance_id: instanceId,
+      checked_in_at: checkedInAt,
+      checked_in: a.checked_in,
+      paid,
+      ticket_type: ticketType,
+      source: 'eventbrite',
+      eventbrite_attendee_id: a.id,
+    })
+
+    if (attErr) {
+      if (attErr.code === '23505') stats.attendancesSkipped++
+      else throw attErr
+    } else {
+      stats.attendancesCreated++
+    }
+  }
+}
+
+function toResult(
+  stats: AttendeeStats,
+  extra: { eventsMatched: number; eventsCreated: number }
+): EventbriteSyncResult {
+  return {
+    ...extra,
+    attendees: {
+      checkedIn: stats.checkedIn,
+      registered: stats.registered,
+      skippedCancelled: stats.skippedCancelled,
+    },
+    peopleCreated: stats.peopleCreated,
+    attendancesCreated: stats.attendancesCreated,
+    attendancesUpdated: stats.attendancesUpdated,
+    attendancesSkipped: stats.attendancesSkipped,
+  }
+}
+
 // Idempotent: matches existing instances by eventbrite_id (from a prior run
 // of this same backfill) or exact/near start time (from Arketa), attendees
 // by eventbrite_attendee_id (so re-running this updates checked_in/paid
 // status instead of just skipping), so it's safe to re-run from a button, a
 // cron job, or a webhook-triggered refresh.
+//
+// Passing eventInstanceId skips the org-wide events/attendees crawl entirely
+// and syncs just that one instance's attendees — used by the check-in page's
+// refresh button, which only cares about one event and was paying for a full
+// 3-month backfill (one HTTP round trip per event) on every click.
 export async function syncEventbrite(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   supabase: SupabaseClient<any, any, any>,
-  { sinceMonthsAgo = 3, sinceDays }: { sinceMonthsAgo?: number; sinceDays?: number } = {}
+  {
+    sinceMonthsAgo = 3,
+    sinceDays,
+    eventInstanceId,
+  }: { sinceMonthsAgo?: number; sinceDays?: number; eventInstanceId?: string } = {}
 ): Promise<EventbriteSyncResult> {
+  const stats = emptyStats()
+
+  if (eventInstanceId) {
+    const { data: instance } = await supabase
+      .from('event_instances')
+      .select('id, eventbrite_id')
+      .eq('id', eventInstanceId)
+      .maybeSingle()
+
+    if (instance?.eventbrite_id) {
+      await syncEventAttendees(supabase, instance.eventbrite_id, instance.id, new Map(), stats)
+      await supabase.from('people').update({ is_active: true }).gte('event_count', 3)
+    }
+
+    return toResult(stats, {
+      eventsMatched: instance?.eventbrite_id ? 1 : 0,
+      eventsCreated: 0,
+    })
+  }
+
   const allEvents = await eventbriteFetchAllEvents(process.env.EVENTBRITE_ORG_ID!)
 
   const cutoff = new Date()
@@ -119,101 +275,15 @@ export async function syncEventbrite(
     eventsMatched++
   }
 
-  let checkedIn = 0
-  let registered = 0
-  let skippedCancelled = 0
-  let peopleCreated = 0
-  let attendancesCreated = 0
-  let attendancesUpdated = 0
-  let attendancesSkipped = 0
   const personIdByEmail = new Map<string, string>()
 
   for (const { eventId, instanceId } of matches) {
-    const attendees = await eventbriteFetchAllAttendees(eventId)
-
-    for (const a of attendees) {
-      if (a.cancelled || a.refunded) {
-        skippedCancelled++
-        continue
-      }
-      a.checked_in ? checkedIn++ : registered++
-
-      const email = a.profile.email?.trim().toLowerCase() || null
-      const fullName =
-        a.profile.name?.trim() ||
-        `${a.profile.first_name ?? ''} ${a.profile.last_name ?? ''}`.trim() ||
-        'Unknown'
-
-      let personId = email ? personIdByEmail.get(email) ?? null : null
-
-      if (!personId && email) {
-        const { data: existingPerson } = await supabase
-          .from('people')
-          .select('id')
-          .ilike('email', email)
-          .limit(1)
-          .maybeSingle()
-        personId = existingPerson?.id ?? null
-      }
-
-      if (!personId) {
-        const { data: newPerson, error } = await supabase
-          .from('people')
-          .insert(email ? { name: fullName, email } : { name: fullName })
-          .select('id')
-          .single()
-        if (error) throw error
-        personId = newPerson.id
-        peopleCreated++
-      }
-
-      if (email) personIdByEmail.set(email, personId!)
-
-      const checkedInAt = a.checked_in ? a.changed || a.created : a.created
-      const paid = a.costs.gross.value > 0
-
-      const { data: updated, error: updErr } = await supabase
-        .from('attendances')
-        .update({ checked_in: a.checked_in, checked_in_at: checkedInAt, paid })
-        .eq('eventbrite_attendee_id', a.id)
-        .select('id')
-      if (updErr) throw updErr
-
-      if (updated && updated.length > 0) {
-        attendancesUpdated++
-        continue
-      }
-
-      const { error: attErr } = await supabase.from('attendances').insert({
-        person_id: personId!,
-        event_instance_id: instanceId,
-        checked_in_at: checkedInAt,
-        checked_in: a.checked_in,
-        paid,
-        source: 'eventbrite',
-        eventbrite_attendee_id: a.id,
-      })
-
-      if (attErr) {
-        if (attErr.code === '23505') attendancesSkipped++
-        else throw attErr
-      } else {
-        attendancesCreated++
-      }
-    }
+    await syncEventAttendees(supabase, eventId, instanceId, personIdByEmail, stats)
   }
 
   await supabase.from('people').update({ is_active: true }).gte('event_count', 3)
 
-  return {
-    eventsMatched,
-    eventsCreated,
-    attendees: { checkedIn, registered, skippedCancelled },
-    peopleCreated,
-    attendancesCreated,
-    attendancesUpdated,
-    attendancesSkipped,
-  }
+  return toResult(stats, { eventsMatched, eventsCreated })
 }
 
 // Instances matched by time (cases 2/3 above) are usually Arketa-created and

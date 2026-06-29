@@ -30,6 +30,7 @@ type AttendeeRecord = {
   source: AttendanceSource
   checked_in: boolean
   paid: boolean | null
+  ticket_type: string | null
   person: {
     id: string
     name: string
@@ -37,6 +38,14 @@ type AttendeeRecord = {
     phone: string | null
     event_count: number
   }
+}
+
+type PersonRecord = {
+  id: string
+  name: string
+  email: string | null
+  phone: string | null
+  event_count: number
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -70,10 +79,16 @@ function CheckInPageInner() {
   const [reminder, setReminder] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [search, setSearch] = useState('')
+  const [eventSearch, setEventSearch] = useState('')
+  const [sourceFilter, setSourceFilter] = useState<'all' | 'eventbrite' | 'arketa'>('all')
+  const [globalMatches, setGlobalMatches] = useState<PersonRecord[]>([])
+  const [searchingGlobal, setSearchingGlobal] = useState(false)
+  const [quickAddingIds, setQuickAddingIds] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
   const [showAddModal, setShowAddModal] = useState(false)
   const [expandedSeries, setExpandedSeries] = useState<Set<string>>(new Set())
   const deepLinkHandled = useRef(false)
+  const globalSearchSeq = useRef(0)
 
   useEffect(() => {
     loadEvents()
@@ -135,6 +150,17 @@ function CheckInPageInner() {
     return [...map.values()].sort((a, b) => b.events.length - a.events.length)
   }, [events])
 
+  const matchedEvents = useMemo(() => {
+    const q = eventSearch.trim().toLowerCase()
+    if (!q) return null
+    return events.filter(
+      e =>
+        e.series.name.toLowerCase().includes(q) ||
+        e.instructor_name?.toLowerCase().includes(q) ||
+        e.series.tag.toLowerCase().includes(q)
+    )
+  }, [events, eventSearch])
+
   async function loadAttendees(event: EventWithSeries) {
     setLoading(true)
     const { data } = await supabase
@@ -152,17 +178,69 @@ function CheckInPageInner() {
   function selectEvent(event: EventWithSeries) {
     setSelectedEvent(event)
     setSearch('')
+    setSourceFilter('all')
+    setGlobalMatches([])
     setView('attendees')
     loadAttendees(event)
   }
 
+  // Beyond filtering the already-registered attendees below, also looks up
+  // matches across every Bhakti Studio person record so someone who isn't
+  // registered for this event can still be found and added on the spot.
+  // Debounced so it doesn't fire a query on every keystroke, and guarded by
+  // a sequence number so a slow, stale response can't overwrite a newer one.
+  useEffect(() => {
+    const q = search.trim()
+    if (!q || !selectedEvent) {
+      setGlobalMatches([])
+      setSearchingGlobal(false)
+      return
+    }
+
+    const seq = ++globalSearchSeq.current
+    setSearchingGlobal(true)
+    const timer = setTimeout(async () => {
+      // Two separate ilike queries rather than a single .or(...) — values
+      // with commas/parens (e.g. "Smith, John") would otherwise be parsed
+      // as PostgREST filter syntax instead of literal search text.
+      const escaped = q.replace(/[%_\\]/g, m => `\\${m}`)
+      const cols = 'id, name, email, phone, event_count'
+      const [byName, byEmail] = await Promise.all([
+        supabase.from('people').select(cols).ilike('name', `%${escaped}%`).limit(8),
+        supabase.from('people').select(cols).ilike('email', `%${escaped}%`).limit(8),
+      ])
+
+      if (seq !== globalSearchSeq.current) return
+
+      const registeredIds = new Set(attendees.map(a => a.person_id))
+      const merged = new Map<string, PersonRecord>()
+      for (const p of [...(byName.data ?? []), ...(byEmail.data ?? [])] as PersonRecord[]) {
+        if (!registeredIds.has(p.id)) merged.set(p.id, p)
+      }
+      setGlobalMatches([...merged.values()].slice(0, 8))
+      setSearchingGlobal(false)
+    }, 300)
+
+    return () => clearTimeout(timer)
+  }, [search, selectedEvent, attendees])
+
   async function refreshFromSources() {
+    if (!selectedEvent) return
     setRefreshing(true)
+    const body = JSON.stringify({ eventInstanceId: selectedEvent.id })
     await Promise.all([
-      fetch('/api/sync/arketa', { method: 'POST' }).catch(() => null),
-      fetch('/api/sync/eventbrite', { method: 'POST' }).catch(() => null),
+      fetch('/api/sync/arketa', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      }).catch(() => null),
+      fetch('/api/sync/eventbrite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      }).catch(() => null),
     ])
-    if (selectedEvent) await loadAttendees(selectedEvent)
+    await loadAttendees(selectedEvent)
     setRefreshing(false)
   }
 
@@ -184,17 +262,36 @@ function CheckInPageInner() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ attendanceId: attendee.id, checkedIn }),
       })
-      if (res.ok) {
-        const result = await res.json()
-        if (attendee.source === 'eventbrite' && !result.eventbritePushed) {
-          const action = checkedIn ? 'check them in' : 'undo their check-in'
-          setReminder(`${checkedIn ? 'Checked in' : 'Unchecked'} locally, but couldn't sync to Eventbrite for ${attendee.person.name} — ${action} there manually`)
-          setTimeout(() => setReminder(null), 6000)
-        } else if (attendee.source === 'arketa' && checkedIn && !result.arketaPushed) {
-          setReminder(`Checked in locally, but couldn't sync to Arketa for ${attendee.person.name}`)
-          setTimeout(() => setReminder(null), 6000)
-        }
+      if (!res.ok) {
+        // The request itself failed (expired session, server error, etc.) —
+        // nothing was saved, not even locally, so the optimistic update above
+        // is wrong and needs to be undone, and this needs its own message
+        // since it's a different failure than a sync push not landing.
+        setAttendees(prev =>
+          prev.map(a => (a.id === attendee.id ? { ...a, checked_in: !checkedIn } : a))
+        )
+        setReminder(`Couldn't save ${checkedIn ? 'check-in' : 'uncheck'} for ${attendee.person.name} — try again`)
+        setTimeout(() => setReminder(null), 6000)
+        return
       }
+
+      const result = await res.json()
+      if (attendee.source === 'eventbrite' && !result.eventbritePushed) {
+        const action = checkedIn ? 'check them in' : 'undo their check-in'
+        setReminder(`${checkedIn ? 'Checked in' : 'Unchecked'} locally, but couldn't sync to Eventbrite for ${attendee.person.name} — ${action} there manually`)
+        setTimeout(() => setReminder(null), 6000)
+      } else if (attendee.source === 'arketa' && checkedIn && !result.arketaPushed) {
+        setReminder(`Checked in locally, but couldn't sync to Arketa for ${attendee.person.name}`)
+        setTimeout(() => setReminder(null), 6000)
+      }
+    } catch {
+      // Network failure — same situation as a non-ok response: nothing was
+      // saved, so revert the optimistic update and surface it.
+      setAttendees(prev =>
+        prev.map(a => (a.id === attendee.id ? { ...a, checked_in: !checkedIn } : a))
+      )
+      setReminder(`Couldn't save ${checkedIn ? 'check-in' : 'uncheck'} for ${attendee.person.name} — check your connection and try again`)
+      setTimeout(() => setReminder(null), 6000)
     } finally {
       setTogglingIds(prev => {
         const next = new Set(prev)
@@ -292,15 +389,57 @@ function CheckInPageInner() {
     return { isDuplicate: false }
   }
 
+  // Adds an existing Bhakti Studio person (found via the global search
+  // below) to this event. They weren't registered through any source, so
+  // checking them in here is the only record of their attendance.
+  async function handleQuickAdd(person: PersonRecord) {
+    if (!selectedEvent) return
+    setQuickAddingIds(prev => new Set([...prev, person.id]))
+
+    const { error } = await supabase.from('attendances').insert({
+      person_id: person.id,
+      event_instance_id: selectedEvent.id,
+      source: 'manual',
+      checked_in: true,
+    })
+
+    if (error) {
+      setReminder(`Couldn't add ${person.name} — try again`)
+      setTimeout(() => setReminder(null), 6000)
+      setQuickAddingIds(prev => {
+        const next = new Set(prev)
+        next.delete(person.id)
+        return next
+      })
+      return
+    }
+
+    // Trigger handles event_count + last_seen_at; we handle is_active
+    const newCount = (person.event_count ?? 0) + 1
+    if (newCount >= 3) {
+      await supabase.from('people').update({ is_active: true }).eq('id', person.id)
+    }
+
+    setGlobalMatches(prev => prev.filter(p => p.id !== person.id))
+    await loadAttendees(selectedEvent)
+    setQuickAddingIds(prev => {
+      const next = new Set(prev)
+      next.delete(person.id)
+      return next
+    })
+  }
+
   const filtered = useMemo(() => {
-    if (!search.trim()) return attendees
+    let list = attendees
+    if (sourceFilter !== 'all') list = list.filter(a => a.source === sourceFilter)
+    if (!search.trim()) return list
     const q = search.toLowerCase()
-    return attendees.filter(
+    return list.filter(
       a =>
         a.person?.name?.toLowerCase().includes(q) ||
         a.person?.email?.toLowerCase().includes(q)
     )
-  }, [attendees, search])
+  }, [attendees, search, sourceFilter])
 
   // ─── Event List View ──────────────────────────────────────────────────────
 
@@ -316,6 +455,13 @@ function CheckInPageInner() {
               day: 'numeric',
             })}
           </p>
+          <input
+            type="search"
+            value={eventSearch}
+            onChange={e => setEventSearch(e.target.value)}
+            placeholder="Search events by name or instructor…"
+            className="w-full mt-4 px-4 py-3 rounded-xl bg-parchment border border-parchment text-espresso placeholder-walnut/50 focus:outline-none focus:ring-2 focus:ring-terracotta text-base"
+          />
         </div>
 
         {loading ? (
@@ -323,6 +469,22 @@ function CheckInPageInner() {
         ) : events.length === 0 ? (
           <div className="px-4 py-16 text-center">
             <p className="text-walnut text-lg">No events found.</p>
+          </div>
+        ) : matchedEvents ? (
+          <div className="max-w-2xl mx-auto px-4 pb-10">
+            {matchedEvents.length === 0 ? (
+              <p className="text-walnut text-sm bg-parchment rounded-2xl px-4 py-4">
+                No events match &ldquo;{eventSearch.trim()}&rdquo;.
+              </p>
+            ) : (
+              <ul className="space-y-3">
+                {matchedEvents.map(event => (
+                  <li key={event.id}>
+                    <EventCard event={event} onClick={() => selectEvent(event)} showDate />
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         ) : (
           <div className="max-w-2xl mx-auto px-4 pb-10 space-y-8">
@@ -449,14 +611,29 @@ function CheckInPageInner() {
             type="search"
             value={search}
             onChange={e => setSearch(e.target.value)}
-            placeholder="Search by name or email…"
+            placeholder="Search registered attendees or all records…"
             className="w-full px-4 py-3 rounded-xl bg-parchment border border-parchment text-espresso placeholder-walnut/50 focus:outline-none focus:ring-2 focus:ring-terracotta text-base"
           />
+          <div className="flex gap-2 mt-3">
+            {(['all', 'eventbrite', 'arketa'] as const).map(opt => (
+              <button
+                key={opt}
+                onClick={() => setSourceFilter(opt)}
+                className={`px-3 py-1.5 rounded-full text-xs font-semibold capitalize transition-colors ${
+                  sourceFilter === opt
+                    ? 'bg-terracotta text-cream'
+                    : 'bg-parchment text-walnut hover:text-espresso'
+                }`}
+              >
+                {opt === 'all' ? 'All sources' : opt}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
       {reminder && (
-        <div className="sticky top-[7.5rem] z-10 max-w-2xl mx-auto w-full px-4">
+        <div className="sticky top-[10rem] z-10 max-w-2xl mx-auto w-full px-4">
           <div className="bg-gold/30 text-espresso text-sm font-medium rounded-xl px-4 py-2.5 mt-2 shadow">
             {reminder}
           </div>
@@ -465,77 +642,132 @@ function CheckInPageInner() {
 
       {/* Attendee list */}
       <div className="flex-1 px-4 pt-3 pb-28 overflow-y-auto">
-        <div className="max-w-2xl mx-auto">
+        <div className="max-w-2xl mx-auto space-y-6">
         {loading ? (
           <Spinner />
-        ) : filtered.length === 0 ? (
-          <div className="py-16 text-center">
-            <p className="text-walnut">
-              {search ? 'No matches found.' : 'No attendees yet.'}
-            </p>
-          </div>
         ) : (
-          <ul className="space-y-2">
-            {filtered.map(attendee => {
-              const isIn = attendee.checked_in
-              const isToggling = togglingIds.has(attendee.id)
-              return (
-                <li
-                  key={attendee.id}
-                  className={`flex items-center gap-3 rounded-2xl p-4 transition-colors ${
-                    isIn ? 'bg-gold/20' : 'bg-parchment'
-                  }`}
-                >
-                  <div className="flex-1 min-w-0">
-                    <p className="text-lg font-semibold text-espresso leading-tight truncate">
-                      {attendee.person?.name}
-                    </p>
-                    {attendee.person?.email && (
-                      <p className="text-sm text-walnut truncate mt-0.5">
-                        {attendee.person.email}
-                      </p>
-                    )}
-                    <div className="flex items-center gap-2 mt-0.5">
-                      <span className="text-xs text-walnut/50 capitalize">
-                        {attendee.source}
-                      </span>
-                      {attendee.paid !== null && (
-                        <span
-                          className={`text-xs font-medium px-1.5 py-0.5 rounded ${
-                            attendee.paid
-                              ? 'bg-gold/30 text-espresso'
-                              : 'bg-terracotta/15 text-terracotta'
-                          }`}
+          <>
+            {/* Registered attendees always come first */}
+            {filtered.length === 0 ? (
+              <div className="py-8 text-center">
+                <p className="text-walnut">
+                  {search ? 'No registered attendees match.' : 'No attendees yet.'}
+                </p>
+              </div>
+            ) : (
+              <ul className="space-y-2">
+                {filtered.map(attendee => {
+                  const isIn = attendee.checked_in
+                  const isToggling = togglingIds.has(attendee.id)
+                  return (
+                    <li
+                      key={attendee.id}
+                      className={`flex items-center gap-3 rounded-2xl p-4 transition-colors ${
+                        isIn ? 'bg-gold/20' : 'bg-parchment'
+                      }`}
+                    >
+                      <div className="flex-1 min-w-0">
+                        <p className="text-lg font-semibold text-espresso leading-tight truncate">
+                          {attendee.person?.name}
+                        </p>
+                        {attendee.person?.email && (
+                          <p className="text-sm text-walnut truncate mt-0.5">
+                            {attendee.person.email}
+                          </p>
+                        )}
+                        <div className="flex items-center gap-2 mt-0.5">
+                          <span className="text-xs text-walnut/50 capitalize">
+                            {attendee.source}
+                          </span>
+                          {attendee.paid !== null && (
+                            <span
+                              className={`text-xs font-medium px-1.5 py-0.5 rounded ${
+                                attendee.paid
+                                  ? 'bg-gold/30 text-espresso'
+                                  : 'bg-terracotta/15 text-terracotta'
+                              }`}
+                            >
+                              {attendee.paid ? 'Paid' : 'Unpaid'}
+                            </span>
+                          )}
+                          {attendee.ticket_type && (
+                            <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-walnut/10 text-walnut">
+                              {attendee.ticket_type}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      {isIn ? (
+                        <button
+                          onClick={() => handleToggleCheckIn(attendee, false)}
+                          disabled={isToggling}
+                          className="flex items-center gap-1.5 bg-gold/30 hover:bg-gold/50 disabled:opacity-50 text-espresso text-sm font-semibold px-4 py-2.5 rounded-xl shrink-0 transition-colors"
                         >
-                          {attendee.paid ? 'Paid' : 'Unpaid'}
-                        </span>
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                          </svg>
+                          In
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => handleToggleCheckIn(attendee, true)}
+                          disabled={isToggling}
+                          className="shrink-0 bg-terracotta hover:bg-rust active:scale-95 disabled:opacity-50 text-cream text-sm font-semibold px-5 py-2.5 rounded-xl transition-transform"
+                        >
+                          Check In
+                        </button>
                       )}
-                    </div>
-                  </div>
-                  {isIn ? (
-                    <button
-                      onClick={() => handleToggleCheckIn(attendee, false)}
-                      disabled={isToggling}
-                      className="flex items-center gap-1.5 bg-gold/30 hover:bg-gold/50 disabled:opacity-50 text-espresso text-sm font-semibold px-4 py-2.5 rounded-xl shrink-0 transition-colors"
-                    >
-                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
-                      </svg>
-                      In
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => handleToggleCheckIn(attendee, true)}
-                      disabled={isToggling}
-                      className="shrink-0 bg-terracotta hover:bg-rust active:scale-95 disabled:opacity-50 text-cream text-sm font-semibold px-5 py-2.5 rounded-xl transition-transform"
-                    >
-                      Check In
-                    </button>
-                  )}
-                </li>
-              )
-            })}
-          </ul>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+
+            {/* People not registered for this event, found across all Bhakti
+                Studio records — added on top so they show up second, after
+                anyone who actually registered. */}
+            {search.trim() && (
+              <div>
+                <h3 className="text-sm font-semibold text-walnut mb-2">
+                  Add from Bhakti Studio records
+                </h3>
+                {searchingGlobal ? (
+                  <p className="text-walnut text-sm px-1">Searching…</p>
+                ) : globalMatches.length === 0 ? (
+                  <p className="text-walnut text-sm px-1">No other matching records.</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {globalMatches.map(person => {
+                      const isAdding = quickAddingIds.has(person.id)
+                      return (
+                        <li
+                          key={person.id}
+                          className="flex items-center gap-3 rounded-2xl p-4 bg-cream border border-parchment"
+                        >
+                          <div className="flex-1 min-w-0">
+                            <p className="text-lg font-semibold text-espresso leading-tight truncate">
+                              {person.name}
+                            </p>
+                            {person.email && (
+                              <p className="text-sm text-walnut truncate mt-0.5">{person.email}</p>
+                            )}
+                            <p className="text-xs text-walnut/50 mt-0.5">Not registered for this event</p>
+                          </div>
+                          <button
+                            onClick={() => handleQuickAdd(person)}
+                            disabled={isAdding}
+                            className="shrink-0 bg-terracotta hover:bg-rust active:scale-95 disabled:opacity-50 text-cream text-sm font-semibold px-4 py-2.5 rounded-xl transition-transform"
+                          >
+                            {isAdding ? 'Adding…' : 'Add & Check In'}
+                          </button>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                )}
+              </div>
+            )}
+          </>
         )}
         </div>
       </div>
@@ -724,10 +956,12 @@ function EventCard({
   event,
   onClick,
   compact,
+  showDate,
 }: {
   event: EventWithSeries
   onClick: () => void
   compact?: boolean
+  showDate?: boolean
 }) {
   const dateLabel = new Date(event.date).toLocaleDateString('en-US', {
     month: 'short',
@@ -755,7 +989,7 @@ function EventCard({
             <p className="text-walnut text-sm mt-0.5">with {event.instructor_name}</p>
           )}
           <p className="text-walnut text-sm mt-1">
-            {compact ? `${dateLabel} · ${timeLabel}` : timeLabel}
+            {compact || showDate ? `${dateLabel} · ${timeLabel}` : timeLabel}
           </p>
         </div>
         {!compact && (

@@ -1,7 +1,7 @@
 import { createClient } from '@/lib/supabase/server'
 import { syncEventbrite } from '@/lib/syncEventbrite'
 
-export async function POST() {
+export async function POST(request: Request) {
   const supabase = await createClient()
 
   const {
@@ -13,6 +13,8 @@ export async function POST() {
     return Response.json({ error: 'Eventbrite is not configured' }, { status: 500 })
   }
 
-  const result = await syncEventbrite(supabase)
+  const { eventInstanceId } = await request.json().catch(() => ({}))
+
+  const result = await syncEventbrite(supabase, { eventInstanceId })
   return Response.json(result)
 }
