@@ -70,6 +70,7 @@ export async function syncEventbrite(
     const exact = instanceByExactDate.get(e.start.utc)
     if (exact) {
       matches.push({ eventId: e.id, instanceId: exact })
+      await backfillEventbriteId(supabase, exact, e.id, instanceByEventbriteId)
       eventsMatched++
       continue
     }
@@ -85,6 +86,7 @@ export async function syncEventbrite(
     }
     if (nearest) {
       matches.push({ eventId: e.id, instanceId: nearest.id })
+      await backfillEventbriteId(supabase, nearest.id, e.id, instanceByEventbriteId)
       eventsMatched++
       continue
     }
@@ -212,4 +214,26 @@ export async function syncEventbrite(
     attendancesUpdated,
     attendancesSkipped,
   }
+}
+
+// Instances matched by time (cases 2/3 above) are usually Arketa-created and
+// never had eventbrite_id set — until now nothing wrote it back, so every
+// event matched that way stayed permanently unlinked for anything that
+// depends on event_instances.eventbrite_id (e.g. pushing a check-in to
+// Eventbrite). Idempotent: a no-op once set.
+async function backfillEventbriteId(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: SupabaseClient<any, any, any>,
+  instanceId: string,
+  eventbriteId: string,
+  instanceByEventbriteId: Map<string, string>
+): Promise<void> {
+  if (instanceByEventbriteId.get(eventbriteId) === instanceId) return
+  const { error } = await supabase
+    .from('event_instances')
+    .update({ eventbrite_id: eventbriteId })
+    .eq('id', instanceId)
+    .is('eventbrite_id', null)
+  if (error) throw error
+  instanceByEventbriteId.set(eventbriteId, instanceId)
 }
