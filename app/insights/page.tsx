@@ -110,6 +110,7 @@ type StudioStats = {
 }
 
 type SortDir = 'asc' | 'desc'
+type GrowthPeriod = '6M' | '1Y' | '2Y' | 'all'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -386,6 +387,8 @@ export default function InsightsPage() {
   const [syncResult, setSyncResult] = useState<string | null>(null)
   const [syncingEB, setSyncingEB] = useState(false)
   const [syncResultEB, setSyncResultEB] = useState<string | null>(null)
+  const [growthPeriod, setGrowthPeriod] = useState<GrowthPeriod>('all')
+  const [showAllSeries, setShowAllSeries] = useState(false)
 
   useEffect(() => {
     loadData()
@@ -496,6 +499,14 @@ export default function InsightsPage() {
     [recommendations]
   )
 
+  const filteredGrowthData = useMemo(() => {
+    if (!studioStats) return []
+    const data = studioStats.growthTrend
+    if (growthPeriod === 'all') return data
+    const months = growthPeriod === '6M' ? 6 : growthPeriod === '1Y' ? 12 : 24
+    return data.slice(-months)
+  }, [studioStats, growthPeriod])
+
   return (
     <div className="min-h-screen bg-cream pt-16">
       <div className="max-w-6xl mx-auto px-4 pt-6 pb-16 space-y-8">
@@ -536,7 +547,7 @@ export default function InsightsPage() {
               </div>
             </section>
 
-            {/* ── Charts ── */}
+            {/* ── Charts row 1: attendance + donut ── */}
             <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
               <ChartCard title="Monthly Attendance (last 12 months)" className="lg:col-span-2">
                 <ResponsiveContainer width="100%" height={260}>
@@ -582,13 +593,35 @@ export default function InsightsPage() {
                   </PieChart>
                 </ResponsiveContainer>
               </ChartCard>
+            </section>
 
-              <ChartCard title="Member Growth (cumulative)" className="lg:col-span-2">
-                {studioStats.growthTrend.length === 0 ? (
+            {/* ── Charts row 2: member growth full-width ── */}
+            <section>
+              <ChartCard
+                title="Member Growth (cumulative)"
+                controls={
+                  <div className="flex gap-1">
+                    {(['6M', '1Y', '2Y', 'all'] as GrowthPeriod[]).map(p => (
+                      <button
+                        key={p}
+                        onClick={() => setGrowthPeriod(p)}
+                        className={`text-xs font-medium px-2.5 py-1 rounded-full transition-colors ${
+                          growthPeriod === p
+                            ? 'bg-espresso text-cream'
+                            : 'bg-cream text-walnut hover:bg-walnut/10'
+                        }`}
+                      >
+                        {p === 'all' ? 'All' : p}
+                      </button>
+                    ))}
+                  </div>
+                }
+              >
+                {filteredGrowthData.length === 0 ? (
                   <EmptyChart message="No attendance history yet." />
                 ) : (
                   <ResponsiveContainer width="100%" height={240}>
-                    <AreaChart data={studioStats.growthTrend}>
+                    <AreaChart data={filteredGrowthData}>
                       <defs>
                         <linearGradient id="growthFill" x1="0" y1="0" x2="0" y2="1">
                           <stop offset="0%" stopColor="var(--color-gold)" stopOpacity={0.5} />
@@ -611,42 +644,68 @@ export default function InsightsPage() {
                   </ResponsiveContainer>
                 )}
               </ChartCard>
-
-              <ChartCard title="Return vs. Conversion by Series">
-                {seriesStats.filter(s => !s.isArchived).length === 0 ? (
-                  <EmptyChart message="No active series yet." />
-                ) : (
-                  <ResponsiveContainer width="100%" height={240}>
-                    <BarChart
-                      data={seriesStats.filter(s => !s.isArchived)}
-                      layout="vertical"
-                      margin={{ left: 8 }}
-                    >
-                      <CartesianGrid stroke="var(--color-parchment)" horizontal={false} />
-                      <XAxis type="number" tick={{ fontSize: 11, fill: 'var(--color-walnut)' }} unit="%" />
-                      <YAxis
-                        type="category"
-                        dataKey="name"
-                        tick={{ fontSize: 11, fill: 'var(--color-walnut)' }}
-                        width={90}
-                      />
-                      <Tooltip
-                        contentStyle={tooltipStyle}
-                        formatter={value => `${Number(value).toFixed(0)}%`}
-                      />
-                      <Legend wrapperStyle={{ fontSize: 12 }} />
-                      <Bar dataKey="returnRate" name="Return rate" fill="var(--color-walnut)" radius={[0, 4, 4, 0]} />
-                      <Bar
-                        dataKey="conversionRate"
-                        name="Conversion rate"
-                        fill="var(--color-gold)"
-                        radius={[0, 4, 4, 0]}
-                      />
-                    </BarChart>
-                  </ResponsiveContainer>
-                )}
-              </ChartCard>
             </section>
+
+            {/* ── Charts row 3: return vs conversion full-width ── */}
+            {(() => {
+              const activeSeries = seriesStats.filter(s => !s.isArchived)
+              const displaySeries = showAllSeries ? activeSeries : activeSeries.slice(0, 10)
+              const chartHeight = Math.max(240, displaySeries.length * 36 + 60)
+              return (
+                <section>
+                  <ChartCard
+                    title="Return vs. Conversion by Series"
+                    controls={
+                      activeSeries.length > 10 ? (
+                        <button
+                          onClick={() => setShowAllSeries(s => !s)}
+                          className="text-xs font-medium px-2.5 py-1 rounded-full bg-cream text-walnut hover:bg-walnut/10 transition-colors"
+                        >
+                          {showAllSeries ? `Top 10` : `Show all ${activeSeries.length}`}
+                        </button>
+                      ) : undefined
+                    }
+                  >
+                    {activeSeries.length === 0 ? (
+                      <EmptyChart message="No active series yet." />
+                    ) : (
+                      <ResponsiveContainer width="100%" height={chartHeight}>
+                        <BarChart
+                          data={displaySeries}
+                          layout="vertical"
+                          margin={{ left: 4, right: 16 }}
+                        >
+                          <CartesianGrid stroke="var(--color-parchment)" horizontal={false} />
+                          <XAxis type="number" tick={{ fontSize: 11, fill: 'var(--color-walnut)' }} unit="%" domain={[0, 100]} />
+                          <YAxis
+                            type="category"
+                            dataKey="name"
+                            tick={{ fontSize: 11, fill: 'var(--color-walnut)' }}
+                            width={160}
+                            tickFormatter={(name: string) =>
+                              name.length > 22 ? name.slice(0, 22) + '…' : name
+                            }
+                          />
+                          <Tooltip
+                            contentStyle={tooltipStyle}
+                            formatter={value => `${Number(value).toFixed(0)}%`}
+                          />
+                          <Legend wrapperStyle={{ fontSize: 12 }} />
+                          <Bar dataKey="returnRate" name="Return rate" fill="var(--color-walnut)" radius={[0, 4, 4, 0]} barSize={12} />
+                          <Bar
+                            dataKey="conversionRate"
+                            name="Conversion rate"
+                            fill="var(--color-gold)"
+                            radius={[0, 4, 4, 0]}
+                            barSize={12}
+                          />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    )}
+                  </ChartCard>
+                </section>
+              )
+            })()}
 
             {/* ── Series Performance Table ── */}
             <SeriesTable stats={seriesStats} recBySeriesId={recBySeriesId} recLoading={recLoading} />
@@ -1013,16 +1072,21 @@ function KpiCard({
 
 function ChartCard({
   title,
+  controls,
   children,
   className = '',
 }: {
   title: string
+  controls?: React.ReactNode
   children: React.ReactNode
   className?: string
 }) {
   return (
     <div className={`bg-parchment rounded-2xl p-4 ${className}`}>
-      <h3 className="text-sm font-semibold text-espresso mb-2">{title}</h3>
+      <div className="flex items-center justify-between gap-3 mb-2">
+        <h3 className="text-sm font-semibold text-espresso">{title}</h3>
+        {controls && <div className="flex items-center gap-1 shrink-0">{controls}</div>}
+      </div>
       {children}
     </div>
   )
