@@ -312,11 +312,19 @@ function computeStudioStats(
   const avgCheckinsPerEvent =
     instancesWithCheckins > 0 ? totalAttendances / instancesWithCheckins : 0
 
-  // Monthly trend: rolling last 12 months ending this month
+  // Monthly trend: full history, month by month, from the earliest attendance to this month
   const now = new Date()
+  const earliestAttendance = allAttendances.reduce<Date | null>((min, att) => {
+    const d = new Date(att.checked_in_at)
+    return !min || d < min ? d : min
+  }, null)
+  const monthsOfHistory = earliestAttendance
+    ? (now.getFullYear() - earliestAttendance.getFullYear()) * 12 +
+      (now.getMonth() - earliestAttendance.getMonth())
+    : 0
   const monthBuckets: MonthBucket[] = []
   const bucketIndex = new Map<string, number>()
-  for (let i = 11; i >= 0; i--) {
+  for (let i = monthsOfHistory; i >= 0; i--) {
     const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
     const key = monthKey(d)
     bucketIndex.set(key, monthBuckets.length)
@@ -388,6 +396,7 @@ export default function InsightsPage() {
   const [syncingEB, setSyncingEB] = useState(false)
   const [syncResultEB, setSyncResultEB] = useState<string | null>(null)
   const [growthPeriod, setGrowthPeriod] = useState<GrowthPeriod>('all')
+  const [monthlyPeriod, setMonthlyPeriod] = useState<GrowthPeriod>('1Y')
   const [showAllSeries, setShowAllSeries] = useState(false)
 
   useEffect(() => {
@@ -507,6 +516,14 @@ export default function InsightsPage() {
     return data.slice(-months)
   }, [studioStats, growthPeriod])
 
+  const filteredMonthlyData = useMemo(() => {
+    if (!studioStats) return []
+    const data = studioStats.monthlyTrend
+    if (monthlyPeriod === 'all') return data
+    const months = monthlyPeriod === '6M' ? 6 : monthlyPeriod === '1Y' ? 12 : 24
+    return data.slice(-months)
+  }, [studioStats, monthlyPeriod])
+
   return (
     <div className="min-h-screen bg-cream pt-16">
       <div className="max-w-6xl mx-auto px-4 pt-6 pb-16 space-y-8">
@@ -549,9 +566,29 @@ export default function InsightsPage() {
 
             {/* ── Charts row 1: attendance + donut ── */}
             <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-              <ChartCard title="Monthly Attendance (last 12 months)" className="lg:col-span-2">
+              <ChartCard
+                title="Monthly Attendance"
+                className="lg:col-span-2"
+                controls={
+                  <div className="flex gap-1">
+                    {(['6M', '1Y', '2Y', 'all'] as GrowthPeriod[]).map(p => (
+                      <button
+                        key={p}
+                        onClick={() => setMonthlyPeriod(p)}
+                        className={`text-xs font-medium px-2.5 py-1 rounded-full transition-colors ${
+                          monthlyPeriod === p
+                            ? 'bg-espresso text-cream'
+                            : 'bg-cream text-walnut hover:bg-walnut/10'
+                        }`}
+                      >
+                        {p === 'all' ? 'All' : p}
+                      </button>
+                    ))}
+                  </div>
+                }
+              >
                 <ResponsiveContainer width="100%" height={260}>
-                  <ComposedChart data={studioStats.monthlyTrend}>
+                  <ComposedChart data={filteredMonthlyData}>
                     <CartesianGrid stroke="var(--color-parchment)" vertical={false} />
                     <XAxis dataKey="label" tick={{ fontSize: 11, fill: 'var(--color-walnut)' }} />
                     <YAxis tick={{ fontSize: 11, fill: 'var(--color-walnut)' }} allowDecimals={false} />
@@ -648,7 +685,9 @@ export default function InsightsPage() {
 
             {/* ── Charts row 3: return vs conversion full-width ── */}
             {(() => {
-              const activeSeries = seriesStats.filter(s => !s.isArchived)
+              const activeSeries = seriesStats
+                .filter(s => !s.isArchived && s.totalAttendances > 0)
+                .sort((a, b) => b.totalAttendances - a.totalAttendances)
               const displaySeries = showAllSeries ? activeSeries : activeSeries.slice(0, 10)
               const chartHeight = Math.max(240, displaySeries.length * 36 + 60)
               return (
