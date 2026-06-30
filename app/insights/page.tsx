@@ -1,6 +1,6 @@
 'use client'
 
-import { Fragment, useState, useEffect, useMemo } from 'react'
+import { Fragment, useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import {
   ResponsiveContainer,
@@ -143,8 +143,6 @@ const MONTH_ABBR = [
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
 ]
 
-const MIN_WINDOW_MONTHS = 3
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function monthKey(d: Date) {
@@ -153,6 +151,20 @@ function monthKey(d: Date) {
 
 function monthLabel(d: Date) {
   return `${MONTH_ABBR[d.getMonth()]} '${String(d.getFullYear()).slice(2)}`
+}
+
+// Index of the first bucket in each calendar year present in a month-keyed series
+function yearTicks(data: { key: string }[]): { index: number; year: string }[] {
+  const ticks: { index: number; year: string }[] = []
+  let lastYear: string | null = null
+  data.forEach((d, i) => {
+    const year = d.key.slice(0, 4)
+    if (year !== lastYear) {
+      ticks.push({ index: i, year })
+      lastYear = year
+    }
+  })
+  return ticks
 }
 
 // Supabase caps un-paginated selects at 1000 rows; page through with .range()
@@ -415,13 +427,26 @@ export default function InsightsPage() {
   const [syncResult, setSyncResult] = useState<string | null>(null)
   const [syncingEB, setSyncingEB] = useState(false)
   const [syncResultEB, setSyncResultEB] = useState<string | null>(null)
-  const [growthWindow, setGrowthWindow] = useState(12)
-  const [monthlyWindow, setMonthlyWindow] = useState(12)
+  const [growthRange, setGrowthRange] = useState<[number, number] | null>(null)
+  const [monthlyRange, setMonthlyRange] = useState<[number, number] | null>(null)
   const [showAllSeries, setShowAllSeries] = useState(false)
 
   useEffect(() => {
     loadData()
   }, [])
+
+  // Default both range sliders to the trailing 12 months once data arrives
+  useEffect(() => {
+    if (!studioStats) return
+    if (growthRange === null) {
+      const len = studioStats.growthTrend.length
+      setGrowthRange([Math.max(0, len - 12), Math.max(0, len - 1)])
+    }
+    if (monthlyRange === null) {
+      const len = studioStats.monthlyTrend.length
+      setMonthlyRange([Math.max(0, len - 12), Math.max(0, len - 1)])
+    }
+  }, [studioStats, growthRange, monthlyRange])
 
   async function syncArketa() {
     setSyncing(true)
@@ -533,22 +558,17 @@ export default function InsightsPage() {
     [recommendations]
   )
 
-  const growthMaxWindow = Math.max(MIN_WINDOW_MONTHS, studioStats?.growthTrend.length ?? MIN_WINDOW_MONTHS)
-  const monthlyMaxWindow = Math.max(MIN_WINDOW_MONTHS, studioStats?.monthlyTrend.length ?? MIN_WINDOW_MONTHS)
-
   const filteredGrowthData = useMemo(() => {
-    if (!studioStats) return []
-    const data = studioStats.growthTrend
-    const window = Math.min(growthWindow, data.length)
-    return window >= data.length ? data : data.slice(-window)
-  }, [studioStats, growthWindow])
+    if (!studioStats || !growthRange) return []
+    const [start, end] = growthRange
+    return studioStats.growthTrend.slice(start, end + 1)
+  }, [studioStats, growthRange])
 
   const filteredMonthlyData = useMemo(() => {
-    if (!studioStats) return []
-    const data = studioStats.monthlyTrend
-    const window = Math.min(monthlyWindow, data.length)
-    return window >= data.length ? data : data.slice(-window)
-  }, [studioStats, monthlyWindow])
+    if (!studioStats || !monthlyRange) return []
+    const [start, end] = monthlyRange
+    return studioStats.monthlyTrend.slice(start, end + 1)
+  }, [studioStats, monthlyRange])
 
   return (
     <div className="min-h-screen bg-cream pt-16">
@@ -596,7 +616,9 @@ export default function InsightsPage() {
                 title="Monthly Attendance"
                 className="lg:col-span-2"
                 controls={
-                  <WindowSlider value={monthlyWindow} max={monthlyMaxWindow} onChange={setMonthlyWindow} />
+                  monthlyRange && (
+                    <RangeSlider data={studioStats.monthlyTrend} value={monthlyRange} onChange={setMonthlyRange} />
+                  )
                 }
               >
                 <ResponsiveContainer width="100%" height={260}>
@@ -649,7 +671,9 @@ export default function InsightsPage() {
               <ChartCard
                 title="Member Growth (cumulative)"
                 controls={
-                  <WindowSlider value={growthWindow} max={growthMaxWindow} onChange={setGrowthWindow} />
+                  growthRange && (
+                    <RangeSlider data={studioStats.growthTrend} value={growthRange} onChange={setGrowthRange} />
+                  )
                 }
               >
                 {filteredGrowthData.length === 0 ? (
@@ -1129,30 +1153,125 @@ function ChartCard({
   )
 }
 
-function WindowSlider({
+// Snap a dragged handle to a year boundary when within 1 month of it
+const SNAP_THRESHOLD = 1
+
+function RangeSlider({
+  data,
   value,
-  max,
   onChange,
 }: {
-  value: number
-  max: number
-  onChange: (months: number) => void
+  data: { key: string; label: string }[]
+  value: [number, number]
+  onChange: (range: [number, number]) => void
 }) {
-  const clamped = Math.min(value, max)
+  const trackRef = useRef<HTMLDivElement>(null)
+  const [dragging, setDragging] = useState<'start' | 'end' | null>(null)
+  const ticks = useMemo(() => yearTicks(data), [data])
+  const maxIdx = Math.max(0, data.length - 1)
+  const [start, end] = value
+
+  const pct = (idx: number) => (maxIdx === 0 ? 0 : (idx / maxIdx) * 100)
+
+  const indexFromClientX = useCallback(
+    (clientX: number) => {
+      const track = trackRef.current
+      if (!track || maxIdx === 0) return 0
+      const rect = track.getBoundingClientRect()
+      const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width))
+      return Math.round(ratio * maxIdx)
+    },
+    [maxIdx]
+  )
+
+  const snapToYear = useCallback(
+    (idx: number) => {
+      let nearest = idx
+      let nearestDist = Infinity
+      for (const t of ticks) {
+        const dist = Math.abs(t.index - idx)
+        if (dist < nearestDist) {
+          nearestDist = dist
+          nearest = t.index
+        }
+      }
+      return nearestDist <= SNAP_THRESHOLD ? nearest : idx
+    },
+    [ticks]
+  )
+
+  useEffect(() => {
+    if (!dragging) return
+    function handleMove(e: PointerEvent) {
+      const idx = snapToYear(indexFromClientX(e.clientX))
+      if (dragging === 'start') onChange([Math.min(idx, end), end])
+      else onChange([start, Math.max(idx, start)])
+    }
+    function handleUp() {
+      setDragging(null)
+    }
+    window.addEventListener('pointermove', handleMove)
+    window.addEventListener('pointerup', handleUp)
+    return () => {
+      window.removeEventListener('pointermove', handleMove)
+      window.removeEventListener('pointerup', handleUp)
+    }
+  }, [dragging, start, end, onChange, indexFromClientX, snapToYear])
+
+  if (maxIdx === 0) return null
+
   return (
-    <div className="flex items-center gap-2 w-44 sm:w-56">
-      <input
-        type="range"
-        min={MIN_WINDOW_MONTHS}
-        max={max}
-        value={clamped}
-        onChange={e => onChange(Number(e.target.value))}
-        className="flex-1 accent-espresso"
-        aria-label="Months to display"
-      />
-      <span className="text-xs font-medium text-walnut w-16 text-right shrink-0">
-        {clamped >= max ? 'All time' : `${clamped} mo`}
-      </span>
+    <div className="w-full sm:w-72 select-none">
+      <div className="flex items-center justify-between mb-1 gap-2">
+        <span className="text-xs font-medium text-walnut truncate">{data[start]?.label}</span>
+        <span className="text-xs text-walnut/40">–</span>
+        <span className="text-xs font-medium text-walnut truncate">{data[end]?.label}</span>
+      </div>
+      <div ref={trackRef} className="relative h-5 flex items-center touch-none">
+        <div className="absolute inset-x-0 h-1.5 rounded-full bg-cream" />
+        <div
+          className="absolute h-1.5 rounded-full bg-gold"
+          style={{ left: `${pct(start)}%`, right: `${100 - pct(end)}%` }}
+        />
+        {ticks.map(t => (
+          <div
+            key={`tick-${t.year}`}
+            className="absolute w-px h-2.5 bg-walnut/30 top-1/2 -translate-y-1/2 pointer-events-none"
+            style={{ left: `${pct(t.index)}%` }}
+          />
+        ))}
+        <button
+          type="button"
+          aria-label="Range start"
+          onPointerDown={e => {
+            e.preventDefault()
+            setDragging('start')
+          }}
+          className="absolute w-3.5 h-3.5 rounded-full bg-espresso border-2 border-cream shadow -translate-x-1/2 cursor-grab active:cursor-grabbing z-10"
+          style={{ left: `${pct(start)}%` }}
+        />
+        <button
+          type="button"
+          aria-label="Range end"
+          onPointerDown={e => {
+            e.preventDefault()
+            setDragging('end')
+          }}
+          className="absolute w-3.5 h-3.5 rounded-full bg-espresso border-2 border-cream shadow -translate-x-1/2 cursor-grab active:cursor-grabbing z-10"
+          style={{ left: `${pct(end)}%` }}
+        />
+      </div>
+      <div className="relative h-3 mt-0.5">
+        {ticks.map(t => (
+          <span
+            key={`label-${t.year}`}
+            className="absolute text-[10px] text-walnut/50 -translate-x-1/2 first:translate-x-0 last:-translate-x-full"
+            style={{ left: `${pct(t.index)}%` }}
+          >
+            {t.year}
+          </span>
+        ))}
+      </div>
     </div>
   )
 }
