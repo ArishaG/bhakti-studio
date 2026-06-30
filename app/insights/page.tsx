@@ -110,7 +110,6 @@ type StudioStats = {
 }
 
 type SortDir = 'asc' | 'desc'
-type GrowthPeriod = '6M' | '1Y' | '2Y' | 'all'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -144,6 +143,8 @@ const MONTH_ABBR = [
   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
 ]
 
+const MIN_WINDOW_MONTHS = 3
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function monthKey(d: Date) {
@@ -152,6 +153,26 @@ function monthKey(d: Date) {
 
 function monthLabel(d: Date) {
   return `${MONTH_ABBR[d.getMonth()]} '${String(d.getFullYear()).slice(2)}`
+}
+
+// Supabase caps un-paginated selects at 1000 rows; page through with .range()
+// so large tables (e.g. attendances) don't silently lose rows from the middle.
+const PAGE_SIZE = 1000
+
+async function fetchAllRows<T>(
+  fetchPage: (from: number, to: number) => Promise<{ data: T[] | null; error: { message: string } | null }>
+): Promise<T[]> {
+  const rows: T[] = []
+  let from = 0
+  for (;;) {
+    const { data, error } = await fetchPage(from, from + PAGE_SIZE - 1)
+    if (error) throw new Error(error.message)
+    if (!data || data.length === 0) break
+    rows.push(...data)
+    if (data.length < PAGE_SIZE) break
+    from += PAGE_SIZE
+  }
+  return rows
 }
 
 // ─── Stats computation ────────────────────────────────────────────────────────
@@ -341,19 +362,18 @@ function computeStudioStats(
   }
   monthBuckets.forEach((b, i) => (b.uniqueAttendees = monthlyPersonSets[i].size))
 
-  // Growth trend: cumulative unique attendees by month of first-ever attendance
+  // Growth trend: cumulative unique attendees, aligned to the same consecutive
+  // month timeline as monthlyTrend so both charts share one continuous x-axis
   const growthBucketMap = new Map<string, number>()
   for (const [, firstDate] of firstAttendanceByPerson) {
     const key = monthKey(firstDate)
     growthBucketMap.set(key, (growthBucketMap.get(key) ?? 0) + 1)
   }
-  const sortedKeys = [...growthBucketMap.keys()].sort()
   let cumulative = 0
-  const growthTrend: GrowthPoint[] = sortedKeys.map(key => {
-    const [y, m] = key.split('-').map(Number)
-    const newAttendees = growthBucketMap.get(key)!
+  const growthTrend: GrowthPoint[] = monthBuckets.map(b => {
+    const newAttendees = growthBucketMap.get(b.key) ?? 0
     cumulative += newAttendees
-    return { key, label: monthLabel(new Date(y, m - 1, 1)), newAttendees, cumulative }
+    return { key: b.key, label: b.label, newAttendees, cumulative }
   })
 
   // Tag breakdown across all-time attendances
@@ -395,8 +415,8 @@ export default function InsightsPage() {
   const [syncResult, setSyncResult] = useState<string | null>(null)
   const [syncingEB, setSyncingEB] = useState(false)
   const [syncResultEB, setSyncResultEB] = useState<string | null>(null)
-  const [growthPeriod, setGrowthPeriod] = useState<GrowthPeriod>('all')
-  const [monthlyPeriod, setMonthlyPeriod] = useState<GrowthPeriod>('1Y')
+  const [growthWindow, setGrowthWindow] = useState(12)
+  const [monthlyWindow, setMonthlyWindow] = useState(12)
   const [showAllSeries, setShowAllSeries] = useState(false)
 
   useEffect(() => {
@@ -445,25 +465,30 @@ export default function InsightsPage() {
 
   async function loadData() {
     setLoading(true)
-    const [{ data: series }, { data: attendances }, { data: instances }, { count: totalPeople }, { count: activeMembers }] =
+    const [{ data: series }, rawAttendances, rawInstances, { count: totalPeople }, { count: activeMembers }] =
       await Promise.all([
         supabase.from('event_series').select('id, name, tag, description, is_archived').order('name'),
-        supabase
-          .from('attendances')
-          .select(
-            'person_id, checked_in_at, event_instance_id, event_instances ( date, instructor_name, series_id, event_series ( name, tag ) )'
-          ),
-        supabase
-          .from('event_instances')
-          .select('id, date, instructor_name, series_id, event_series ( name, tag )')
-          .order('date', { ascending: false }),
+        fetchAllRows<RawAttendance>((from, to) =>
+          supabase
+            .from('attendances')
+            .select(
+              'person_id, checked_in_at, event_instance_id, event_instances ( date, instructor_name, series_id, event_series ( name, tag ) )'
+            )
+            .order('checked_in_at', { ascending: true })
+            .range(from, to) as unknown as Promise<{ data: RawAttendance[] | null; error: { message: string } | null }>
+        ),
+        fetchAllRows<RawInstance>((from, to) =>
+          supabase
+            .from('event_instances')
+            .select('id, date, instructor_name, series_id, event_series ( name, tag )')
+            .order('date', { ascending: false })
+            .range(from, to) as unknown as Promise<{ data: RawInstance[] | null; error: { message: string } | null }>
+        ),
         supabase.from('people').select('id', { count: 'exact', head: true }),
         supabase.from('people').select('id', { count: 'exact', head: true }).eq('is_active', true),
       ])
 
     const rawSeries = (series as RawSeries[]) ?? []
-    const rawAttendances = (attendances as unknown as RawAttendance[]) ?? []
-    const rawInstances = (instances as unknown as RawInstance[]) ?? []
 
     const computedSeries = computeSeriesStats(rawSeries, rawAttendances)
     const computedInstances = computeInstanceStats(rawInstances, rawAttendances)
@@ -508,21 +533,22 @@ export default function InsightsPage() {
     [recommendations]
   )
 
+  const growthMaxWindow = Math.max(MIN_WINDOW_MONTHS, studioStats?.growthTrend.length ?? MIN_WINDOW_MONTHS)
+  const monthlyMaxWindow = Math.max(MIN_WINDOW_MONTHS, studioStats?.monthlyTrend.length ?? MIN_WINDOW_MONTHS)
+
   const filteredGrowthData = useMemo(() => {
     if (!studioStats) return []
     const data = studioStats.growthTrend
-    if (growthPeriod === 'all') return data
-    const months = growthPeriod === '6M' ? 6 : growthPeriod === '1Y' ? 12 : 24
-    return data.slice(-months)
-  }, [studioStats, growthPeriod])
+    const window = Math.min(growthWindow, data.length)
+    return window >= data.length ? data : data.slice(-window)
+  }, [studioStats, growthWindow])
 
   const filteredMonthlyData = useMemo(() => {
     if (!studioStats) return []
     const data = studioStats.monthlyTrend
-    if (monthlyPeriod === 'all') return data
-    const months = monthlyPeriod === '6M' ? 6 : monthlyPeriod === '1Y' ? 12 : 24
-    return data.slice(-months)
-  }, [studioStats, monthlyPeriod])
+    const window = Math.min(monthlyWindow, data.length)
+    return window >= data.length ? data : data.slice(-window)
+  }, [studioStats, monthlyWindow])
 
   return (
     <div className="min-h-screen bg-cream pt-16">
@@ -570,21 +596,7 @@ export default function InsightsPage() {
                 title="Monthly Attendance"
                 className="lg:col-span-2"
                 controls={
-                  <div className="flex gap-1">
-                    {(['6M', '1Y', '2Y', 'all'] as GrowthPeriod[]).map(p => (
-                      <button
-                        key={p}
-                        onClick={() => setMonthlyPeriod(p)}
-                        className={`text-xs font-medium px-2.5 py-1 rounded-full transition-colors ${
-                          monthlyPeriod === p
-                            ? 'bg-espresso text-cream'
-                            : 'bg-cream text-walnut hover:bg-walnut/10'
-                        }`}
-                      >
-                        {p === 'all' ? 'All' : p}
-                      </button>
-                    ))}
-                  </div>
+                  <WindowSlider value={monthlyWindow} max={monthlyMaxWindow} onChange={setMonthlyWindow} />
                 }
               >
                 <ResponsiveContainer width="100%" height={260}>
@@ -637,21 +649,7 @@ export default function InsightsPage() {
               <ChartCard
                 title="Member Growth (cumulative)"
                 controls={
-                  <div className="flex gap-1">
-                    {(['6M', '1Y', '2Y', 'all'] as GrowthPeriod[]).map(p => (
-                      <button
-                        key={p}
-                        onClick={() => setGrowthPeriod(p)}
-                        className={`text-xs font-medium px-2.5 py-1 rounded-full transition-colors ${
-                          growthPeriod === p
-                            ? 'bg-espresso text-cream'
-                            : 'bg-cream text-walnut hover:bg-walnut/10'
-                        }`}
-                      >
-                        {p === 'all' ? 'All' : p}
-                      </button>
-                    ))}
-                  </div>
+                  <WindowSlider value={growthWindow} max={growthMaxWindow} onChange={setGrowthWindow} />
                 }
               >
                 {filteredGrowthData.length === 0 ? (
@@ -1127,6 +1125,34 @@ function ChartCard({
         {controls && <div className="flex items-center gap-1 shrink-0">{controls}</div>}
       </div>
       {children}
+    </div>
+  )
+}
+
+function WindowSlider({
+  value,
+  max,
+  onChange,
+}: {
+  value: number
+  max: number
+  onChange: (months: number) => void
+}) {
+  const clamped = Math.min(value, max)
+  return (
+    <div className="flex items-center gap-2 w-44 sm:w-56">
+      <input
+        type="range"
+        min={MIN_WINDOW_MONTHS}
+        max={max}
+        value={clamped}
+        onChange={e => onChange(Number(e.target.value))}
+        className="flex-1 accent-espresso"
+        aria-label="Months to display"
+      />
+      <span className="text-xs font-medium text-walnut w-16 text-right shrink-0">
+        {clamped >= max ? 'All time' : `${clamped} mo`}
+      </span>
     </div>
   )
 }
