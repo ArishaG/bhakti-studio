@@ -540,8 +540,8 @@ export default function InsightsPage() {
     setSyncingEB(false)
   }
 
-  async function loadData() {
-    setLoading(true)
+  async function loadData(silent = false) {
+    if (!silent) setLoading(true)
     const [{ data: series }, rawAttendances, rawInstances, { count: totalPeople }, { count: activeMembers }] =
       await Promise.all([
         supabase.from('event_series').select('id, name, tag, description, is_archived').order('name'),
@@ -829,7 +829,7 @@ export default function InsightsPage() {
                 instances={instanceStats}
                 allSeries={seriesStats}
                 onClose={() => setShowOrganizer(false)}
-                onRefresh={loadData}
+                onRefresh={() => loadData(true)}
               />
             ) : (
               <InstanceTable instances={instanceStats} onOrganize={() => setShowOrganizer(true)} />
@@ -1031,7 +1031,7 @@ function SeriesTable({
 
       <div className="bg-parchment rounded-2xl overflow-x-auto">
         <table className="w-full text-sm min-w-[900px]">
-          <thead>
+          <thead className="sticky top-16 z-10 bg-parchment">
             <tr className="border-b border-cream/80">
               <Th label="Series" sortKey="name" current={sortKey} dir={sortDir} onClick={toggleSort} />
               <th className="text-left px-4 py-2.5 text-xs font-medium text-walnut">Tag</th>
@@ -1359,6 +1359,10 @@ function InstanceTable({ instances, onOrganize }: { instances: InstanceStat[]; o
 
 // ─── Series Organizer ────────────────────────────────────────────────────────────
 
+type OrgTarget =
+  | { kind: 'group'; id: string; label: string; tag: EventTag; assignSeriesId: string; memberIds: string[] }
+  | { kind: 'series'; id: string; label: string; tag: EventTag; assignSeriesId: string }
+
 function SeriesOrganizer({
   instances,
   allSeries,
@@ -1373,7 +1377,7 @@ function SeriesOrganizer({
   const supabase = useMemo(() => createClient(), [])
 
   const [draggedId, setDraggedId] = useState<string | null>(null)
-  const [hoverSeriesId, setHoverSeriesId] = useState<string | null>(null)
+  const [hoverTargetId, setHoverTargetId] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [localMoves, setLocalMoves] = useState<Map<string, string>>(new Map())
   const [newSeriesName, setNewSeriesName] = useState('')
@@ -1383,40 +1387,56 @@ function SeriesOrganizer({
   const [errors, setErrors] = useState<Map<string, string>>(new Map())
   const [createdSeries, setCreatedSeries] = useState<Array<{ id: string; name: string; tag: EventTag }>>([])
 
-  function effectiveSeriesId(inst: InstanceStat): string {
-    return localMoves.get(inst.id) ?? inst.seriesId
-  }
+  // Build group / individual drop targets from GROUP_RULES + allSeries
+  const { dropTargets, groupedSeriesIds } = useMemo(() => {
+    const buckets = new Map<string, SeriesStat[]>(GROUP_RULES.map(r => [r.id, []]))
+    const ungrouped: SeriesStat[] = []
 
-  function effectiveSeriesName(inst: InstanceStat): string {
-    const sid = effectiveSeriesId(inst)
-    if (sid === inst.seriesId) return inst.seriesName
-    const found = allSeries.find(s => s.id === sid) ?? createdSeries.find(s => s.id === sid)
-    return found?.name ?? inst.seriesName
-  }
-
-  const filteredInstances = useMemo(() => {
-    let rows = instances
-    if (search.trim()) {
-      const q = search.toLowerCase()
-      rows = rows.filter(i =>
-        i.seriesName.toLowerCase().includes(q) ||
-        i.date.includes(q) ||
-        (i.instructorName?.toLowerCase().includes(q) ?? false)
-      )
+    for (const s of allSeries.filter(s => !s.isArchived)) {
+      const rule = GROUP_RULES.find(r => r.matches(s.name))
+      if (rule) buckets.get(rule.id)!.push(s)
+      else ungrouped.push(s)
     }
-    return [...rows].sort((a, b) => b.date.localeCompare(a.date))
-  }, [instances, search])
 
-  const allDropTargets = useMemo(() => {
-    const fromStats = allSeries.filter(s => !s.isArchived).map(s => ({
-      id: s.id, name: s.name, tag: s.tag,
-    }))
+    const targets: OrgTarget[] = []
+    const groupedIds = new Set<string>()
+
+    for (const rule of GROUP_RULES) {
+      const members = buckets.get(rule.id)!
+      if (members.length < 2) {
+        if (members.length === 1) ungrouped.push(members[0])
+        continue
+      }
+      const sorted = [...members].sort((a, b) => b.totalAttendances - a.totalAttendances)
+      const memberIds = sorted.map(m => m.id)
+      memberIds.forEach(id => groupedIds.add(id))
+      const tagTotals = new Map<EventTag, number>()
+      members.forEach(m => tagTotals.set(m.tag, (tagTotals.get(m.tag) ?? 0) + m.totalAttendances))
+      const tag = [...tagTotals.entries()].sort((a, b) => b[1] - a[1])[0][0]
+      targets.push({ kind: 'group', id: rule.id, label: rule.label, tag, assignSeriesId: sorted[0].id, memberIds })
+    }
+
+    // Deduplicate ungrouped then sort
     const seen = new Set<string>()
-    return [...fromStats, ...createdSeries]
-      .filter(s => { if (seen.has(s.id)) return false; seen.add(s.id); return true })
-      .sort((a, b) => a.name.localeCompare(b.name))
+    for (const s of ungrouped) {
+      if (seen.has(s.id)) continue
+      seen.add(s.id)
+      targets.push({ kind: 'series', id: s.id, label: s.name, tag: s.tag, assignSeriesId: s.id })
+    }
+
+    // Newly created series not yet in allSeries
+    const existingIds = new Set(allSeries.map(s => s.id))
+    for (const s of createdSeries) {
+      if (!existingIds.has(s.id)) {
+        targets.push({ kind: 'series', id: s.id, label: s.name, tag: s.tag, assignSeriesId: s.id })
+      }
+    }
+
+    targets.sort((a, b) => a.label.localeCompare(b.label))
+    return { dropTargets: targets, groupedSeriesIds: groupedIds }
   }, [allSeries, createdSeries])
 
+  // Count instances per series (local moves applied)
   const countBySeries = useMemo(() => {
     const m = new Map<string, number>()
     for (const inst of instances) {
@@ -1426,14 +1446,33 @@ function SeriesOrganizer({
     return m
   }, [instances, localMoves])
 
-  async function moveInstance(instanceId: string, targetSeriesId: string) {
-    setLocalMoves(prev => new Map(prev).set(instanceId, targetSeriesId))
+  function getTargetCount(target: OrgTarget): number {
+    if (target.kind === 'series') return countBySeries.get(target.id) ?? 0
+    return target.memberIds.reduce((sum, sid) => sum + (countBySeries.get(sid) ?? 0), 0)
+  }
+
+  // Left panel: only events not already in a recognized group, not yet moved this session
+  const unsortedInstances = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    return instances
+      .filter(inst => !localMoves.has(inst.id) && !groupedSeriesIds.has(inst.seriesId))
+      .filter(inst =>
+        !q ||
+        inst.seriesName.toLowerCase().includes(q) ||
+        inst.date.includes(q) ||
+        (inst.instructorName?.toLowerCase().includes(q) ?? false)
+      )
+      .sort((a, b) => b.date.localeCompare(a.date))
+  }, [instances, groupedSeriesIds, localMoves, search])
+
+  async function moveInstance(instanceId: string, assignSeriesId: string) {
+    setLocalMoves(prev => new Map(prev).set(instanceId, assignSeriesId))
     setSaving(prev => new Set(prev).add(instanceId))
     setErrors(prev => { const m = new Map(prev); m.delete(instanceId); return m })
 
     const { error } = await supabase
       .from('event_instances')
-      .update({ series_id: targetSeriesId })
+      .update({ series_id: assignSeriesId })
       .eq('id', instanceId)
 
     setSaving(prev => { const s = new Set(prev); s.delete(instanceId); return s })
@@ -1441,6 +1480,8 @@ function SeriesOrganizer({
     if (error) {
       setLocalMoves(prev => { const m = new Map(prev); m.delete(instanceId); return m })
       setErrors(prev => new Map(prev).set(instanceId, error.message))
+    } else {
+      onRefresh()
     }
   }
 
@@ -1456,19 +1497,23 @@ function SeriesOrganizer({
       .single()
 
     setCreating(false)
-    if (error) {
-      alert(`Failed to create series: ${error.message}`)
-      return
-    }
+    if (error) { alert(`Failed to create series: ${error.message}`); return }
     setCreatedSeries(prev => [...prev, { id: data.id, name: data.name, tag: data.tag as EventTag }])
     setNewSeriesName('')
     onRefresh()
   }
 
+  const movedCount = localMoves.size
+
   return (
     <section>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold text-espresso">Organize Events</h2>
+        <div>
+          <h2 className="text-lg font-semibold text-espresso">Organize Events</h2>
+          {movedCount > 0 && (
+            <p className="text-xs text-terracotta mt-0.5">{movedCount} event{movedCount !== 1 ? 's' : ''} moved this session</p>
+          )}
+        </div>
         <button
           onClick={onClose}
           className="text-xs font-medium px-3 py-1.5 rounded-full bg-parchment text-walnut hover:bg-walnut/10 transition-colors"
@@ -1478,14 +1523,14 @@ function SeriesOrganizer({
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-        {/* Left: Events list */}
+        {/* Left: Unsorted events */}
         <div className="lg:col-span-3 bg-parchment rounded-2xl p-4">
           <div className="flex items-center justify-between mb-3">
             <p className="text-sm font-semibold text-espresso">
-              All Events
-              <span className="ml-2 text-xs font-normal text-walnut">({instances.length})</span>
+              Unsorted Events
+              <span className="ml-2 text-xs font-normal text-walnut">({unsortedInstances.length})</span>
             </p>
-            <span className="text-[10px] text-walnut/50">drag to reassign →</span>
+            <span className="text-[10px] text-walnut/50">drag to a series →</span>
           </div>
 
           <input
@@ -1497,11 +1542,9 @@ function SeriesOrganizer({
           />
 
           <div className="space-y-0.5 max-h-[70vh] overflow-y-auto">
-            {filteredInstances.map(inst => {
-              const moved = localMoves.has(inst.id)
+            {unsortedInstances.map(inst => {
               const isSaving = saving.has(inst.id)
               const err = errors.get(inst.id)
-              const sName = effectiveSeriesName(inst)
               return (
                 <div
                   key={inst.id}
@@ -1518,9 +1561,7 @@ function SeriesOrganizer({
                 >
                   <span className="text-walnut/25 shrink-0">⠿</span>
                   <div className="min-w-0 flex-1">
-                    <p className={`text-xs font-medium truncate ${moved ? 'text-terracotta' : 'text-espresso'}`}>
-                      {sName}
-                    </p>
+                    <p className="text-xs font-medium truncate text-espresso">{inst.seriesName}</p>
                     <p className="text-[10px] text-walnut/50 truncate">
                       {new Date(inst.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
                       {inst.instructorName ? ` · ${inst.instructorName}` : ''}
@@ -1528,21 +1569,21 @@ function SeriesOrganizer({
                     </p>
                     {err && <p className="text-[10px] text-red-500 mt-0.5 truncate">{err}</p>}
                   </div>
-                  {isSaving ? (
+                  {isSaving && (
                     <div className="w-3 h-3 border border-walnut/40 border-t-transparent rounded-full animate-spin shrink-0" />
-                  ) : moved ? (
-                    <span className="text-[10px] text-terracotta font-medium shrink-0">moved</span>
-                  ) : null}
+                  )}
                 </div>
               )
             })}
-            {filteredInstances.length === 0 && (
-              <p className="text-xs text-walnut/40 text-center py-6">No events match.</p>
+            {unsortedInstances.length === 0 && (
+              <p className="text-xs text-walnut/40 text-center py-8">
+                {search.trim() ? 'No events match.' : '✓ All events are sorted!'}
+              </p>
             )}
           </div>
         </div>
 
-        {/* Right: Create series + drop zones */}
+        {/* Right: Create series + drop targets */}
         <div className="lg:col-span-2 space-y-3">
           {/* Create new series */}
           <div className="bg-parchment rounded-2xl p-4">
@@ -1576,54 +1617,56 @@ function SeriesOrganizer({
             </form>
           </div>
 
-          {/* Series drop zones */}
+          {/* Series & group drop targets (mirrors Series Performance grouping) */}
           <div className="bg-parchment rounded-2xl p-4">
             <p className="text-sm font-semibold text-espresso mb-3">
-              Series
-              <span className="ml-2 text-xs font-normal text-walnut">({allDropTargets.length})</span>
+              Series & Groups
+              <span className="ml-2 text-xs font-normal text-walnut">({dropTargets.length})</span>
             </p>
-            <div className="space-y-0.5 max-h-[60vh] overflow-y-auto">
-              {allDropTargets.map(series => {
-                const isOver = hoverSeriesId === series.id
-                const count = countBySeries.get(series.id) ?? 0
+            <div className="space-y-0.5 max-h-[65vh] overflow-y-auto">
+              {dropTargets.map(target => {
+                const isOver = hoverTargetId === target.id
+                const count = getTargetCount(target)
+                const isGroup = target.kind === 'group'
                 return (
                   <div
-                    key={series.id}
+                    key={target.id}
                     onDragOver={e => {
                       e.preventDefault()
                       e.dataTransfer.dropEffect = 'move'
-                      setHoverSeriesId(series.id)
+                      setHoverTargetId(target.id)
                     }}
                     onDragLeave={e => {
                       if (!e.currentTarget.contains(e.relatedTarget as Node)) {
-                        setHoverSeriesId(null)
+                        setHoverTargetId(null)
                       }
                     }}
                     onDrop={e => {
                       e.preventDefault()
                       const instanceId = e.dataTransfer.getData('text/plain')
-                      if (instanceId) moveInstance(instanceId, series.id)
-                      setHoverSeriesId(null)
+                      if (instanceId) moveInstance(instanceId, target.assignSeriesId)
+                      setHoverTargetId(null)
                     }}
                     className={`flex items-center justify-between px-3 py-2 rounded-lg transition-all border-2 ${
-                      isOver
-                        ? 'border-gold bg-gold/10'
-                        : 'border-transparent hover:bg-cream/60'
+                      isOver ? 'border-gold bg-gold/10' : 'border-transparent hover:bg-cream/60'
                     }`}
                   >
                     <div className="min-w-0 flex-1">
-                      <p className="text-xs font-medium text-espresso truncate">{series.name}</p>
-                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full capitalize ${TAG_STYLES[series.tag]}`}>
-                        {series.tag}
+                      <p className={`truncate ${isGroup ? 'text-xs font-semibold text-espresso' : 'text-xs font-medium text-walnut/80'}`}>
+                        {isGroup ? '▶ ' : ''}{target.label}
+                        {isGroup && (
+                          <span className="ml-1.5 text-[10px] font-normal text-walnut/40">
+                            {(target as Extract<OrgTarget, { kind: 'group' }>).memberIds.length} series
+                          </span>
+                        )}
+                      </p>
+                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full capitalize ${TAG_STYLES[target.tag]}`}>
+                        {target.tag}
                       </span>
                     </div>
                     <div className="flex items-center gap-2 shrink-0 ml-2">
-                      {count > 0 && (
-                        <span className="text-[10px] text-walnut/50">{count}</span>
-                      )}
-                      {isOver && draggedId && (
-                        <span className="text-[10px] text-gold font-semibold">drop</span>
-                      )}
+                      {count > 0 && <span className="text-[10px] text-walnut/50">{count}</span>}
+                      {isOver && draggedId && <span className="text-[10px] text-gold font-semibold">drop</span>}
                     </div>
                   </div>
                 )
