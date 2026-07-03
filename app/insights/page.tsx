@@ -62,9 +62,14 @@ type SeriesStat = {
   totalAttendances: number
   uniqueAttendees: number
   returnRate: number
-  conversionRate: number | null
+  conversionRate: number | null  // outreach→core (used for AI recs)
   hasEnoughData: boolean
   monthsOfData: number
+  instanceCount: number          // distinct events with ≥1 check-in
+  avgAttendance: number          // totalAttendances / instanceCount
+  newAttendeeCount: number       // attendees for whom this was their 1st ever Bhakti event
+  newAttendeeConversion: number  // % of those who came to any later Bhakti event
+  returningMembers: number       // attendees who already had a prior Bhakti event
 }
 
 type InstanceStat = {
@@ -208,6 +213,18 @@ function computeSeriesStats(
     a => a.event_instances?.series_id && coreIds.has(a.event_instances.series_id)
   )
 
+  // Earliest Bhakti attendance per person across all series (for new vs returning detection)
+  const globalFirst = new Map<string, string>()
+  const allDatesByPerson = new Map<string, string[]>()
+  for (const att of allAttendances) {
+    const { person_id, checked_in_at } = att
+    if (!globalFirst.has(person_id) || checked_in_at < globalFirst.get(person_id)!) {
+      globalFirst.set(person_id, checked_in_at)
+    }
+    if (!allDatesByPerson.has(person_id)) allDatesByPerson.set(person_id, [])
+    allDatesByPerson.get(person_id)!.push(checked_in_at)
+  }
+
   return allSeries.map(series => {
     const atts = bySeriesId.get(series.id) ?? []
     const totalAttendances = atts.length
@@ -252,6 +269,33 @@ function computeSeriesStats(
         (last.getMonth() - first.getMonth())
     }
 
+    // Earliest date each person attended THIS series
+    const firstInSeriesByPerson = new Map<string, string>()
+    for (const att of atts) {
+      const cur = firstInSeriesByPerson.get(att.person_id)
+      if (!cur || att.checked_in_at < cur) firstInSeriesByPerson.set(att.person_id, att.checked_in_at)
+    }
+
+    let newAttendeeCount = 0
+    let newAttendeeConverted = 0
+    let returningMembers = 0
+
+    for (const [personId, firstHere] of firstInSeriesByPerson) {
+      if (firstHere === globalFirst.get(personId)) {
+        // This was their very first Bhakti event globally
+        newAttendeeCount++
+        const laterEvents = (allDatesByPerson.get(personId) ?? []).some(d => d > firstHere)
+        if (laterEvents) newAttendeeConverted++
+      } else {
+        // They had attended Bhakti events before this series
+        returningMembers++
+      }
+    }
+
+    const instanceCount = new Set(atts.map(a => a.event_instance_id)).size
+    const avgAttendance = instanceCount > 0 ? totalAttendances / instanceCount : 0
+    const newAttendeeConversion = newAttendeeCount > 0 ? (newAttendeeConverted / newAttendeeCount) * 100 : 0
+
     return {
       id: series.id,
       name: series.name,
@@ -264,6 +308,11 @@ function computeSeriesStats(
       conversionRate,
       hasEnoughData: monthsOfData >= 3 && totalAttendances >= 5,
       monthsOfData,
+      instanceCount,
+      avgAttendance,
+      newAttendeeCount,
+      newAttendeeConversion,
+      returningMembers,
     }
   })
 }
@@ -790,15 +839,26 @@ const tooltipStyle = {
 
 // ─── Series Performance Table ─────────────────────────────────────────────────
 
-type SeriesSortKey = 'name' | 'totalAttendances' | 'uniqueAttendees' | 'returnRate' | 'conversionRate'
+type SeriesSortKey = 'name' | 'totalAttendances' | 'uniqueAttendees' | 'returnRate' | 'conversionRate' | 'instanceCount' | 'avgAttendance' | 'returningMembers' | 'newAttendeeConversion'
 
 // Category grouping rules — order matters (first match wins)
 const GROUP_RULES: { id: string; label: string; matches: (n: string) => boolean }[] = [
-  { id: 'kirtan',            label: 'Kirtan Events',        matches: n => /kirtan/i.test(n) },
+  { id: 'harmonium',         label: 'Harmonium Classes',     matches: n => /harmonium/i.test(n) },
+  { id: 'kirtan',            label: 'Kirtan Events',         matches: n => /kirtan/i.test(n) },
   { id: 'outdoor-yoga',      label: 'Outdoor Yoga',          matches: n => /outdoor yoga/i.test(n) },
+  { id: 'self-care-lab',     label: 'Self Care Lab',         matches: n => /self care lab/i.test(n) },
+  { id: 'bhakti-open-mic',   label: 'Bhakti Open Mic',       matches: n => /open mic/i.test(n) },
+  { id: 'bhakti-book-club',  label: 'Bhakti Book Club',      matches: n => /book club/i.test(n) },
+  { id: 'reflection-room',   label: 'Reflection Room',       matches: n => /reflection room/i.test(n) },
+  { id: 'astrology',         label: 'Astrology',             matches: n => /astrology|zodiac/i.test(n) },
+  { id: 'gong-sound',        label: 'Gong Sound Immersion',  matches: n => /gong sound/i.test(n) },
+  { id: 'cinema',            label: 'Cinema Nights',         matches: n => /cinema night|community movie/i.test(n) },
+  { id: 'values-lab',        label: 'The Values Lab',        matches: n => /values lab/i.test(n) },
   { id: 'bhakti-talks',      label: 'Bhakti Talks',          matches: n => /bhakti talks/i.test(n) },
   { id: 'ayurvedic-cooking', label: 'Ayurvedic Cooking',     matches: n => /ayurved/i.test(n) },
   { id: 'soul-talks',        label: 'Soul Talks',            matches: n => /^soul talks/i.test(n) },
+  { id: 'yoga-beyond-mat',   label: 'Yoga Beyond the Mat',   matches: n => /beyond the mat/i.test(n) },
+  { id: 'yoga',              label: 'Yoga',                  matches: n => /\byoga\b/i.test(n) },
 ]
 
 type SeriesGroup = {
@@ -808,8 +868,13 @@ type SeriesGroup = {
   members: SeriesStat[]     // sorted by totalAttendances desc
   totalAttendances: number
   uniqueAttendees: number
-  returnRate: number        // weighted average by uniqueAttendees
+  returnRate: number        // weighted avg by uniqueAttendees
   conversionRate: number | null
+  instanceCount: number
+  avgAttendance: number
+  newAttendeeCount: number
+  newAttendeeConversion: number
+  returningMembers: number
 }
 
 type TableRow =
@@ -843,6 +908,14 @@ function buildRows(stats: SeriesStat[], sortKey: SeriesSortKey, sortDir: SortDir
       ? convMembers.reduce((s, m) => s + m.conversionRate! * m.uniqueAttendees, 0) / convWeight
       : null
 
+    const instanceCount = members.reduce((s, m) => s + m.instanceCount, 0)
+    const avgAttendance = instanceCount > 0 ? totalAttendances / instanceCount : 0
+    const newAttendeeCount = members.reduce((s, m) => s + m.newAttendeeCount, 0)
+    const newAttendeeConversion = newAttendeeCount > 0
+      ? members.reduce((s, m) => s + m.newAttendeeConversion * m.newAttendeeCount, 0) / newAttendeeCount
+      : 0
+    const returningMembers = members.reduce((s, m) => s + m.returningMembers, 0)
+
     const tagCount = new Map<EventTag, number>()
     members.forEach(m => tagCount.set(m.tag, (tagCount.get(m.tag) ?? 0) + m.totalAttendances))
     const tag = [...tagCount.entries()].sort((a, b) => b[1] - a[1])[0][0]
@@ -852,6 +925,7 @@ function buildRows(stats: SeriesStat[], sortKey: SeriesSortKey, sortDir: SortDir
       data: {
         id: rule.id, label: rule.label, tag, members: [...members].sort((a, b) => b.totalAttendances - a.totalAttendances),
         totalAttendances, uniqueAttendees, returnRate, conversionRate,
+        instanceCount, avgAttendance, newAttendeeCount, newAttendeeConversion, returningMembers,
       },
     })
   }
@@ -944,22 +1018,25 @@ function SeriesTable({
       </div>
 
       <div className="bg-parchment rounded-2xl overflow-x-auto">
-        <table className="w-full text-sm min-w-[640px]">
+        <table className="w-full text-sm min-w-[900px]">
           <thead>
             <tr className="border-b border-cream/80">
               <Th label="Series" sortKey="name" current={sortKey} dir={sortDir} onClick={toggleSort} />
               <th className="text-left px-4 py-2.5 text-xs font-medium text-walnut">Tag</th>
+              <Th label="Events" sortKey="instanceCount" current={sortKey} dir={sortDir} onClick={toggleSort} align="right" />
+              <Th label="Avg Att." sortKey="avgAttendance" current={sortKey} dir={sortDir} onClick={toggleSort} align="right" />
               <Th label="Check-ins" sortKey="totalAttendances" current={sortKey} dir={sortDir} onClick={toggleSort} align="right" />
               <Th label="Unique" sortKey="uniqueAttendees" current={sortKey} dir={sortDir} onClick={toggleSort} align="right" />
+              <Th label="Returning" sortKey="returningMembers" current={sortKey} dir={sortDir} onClick={toggleSort} align="right" />
               <Th label="Return %" sortKey="returnRate" current={sortKey} dir={sortDir} onClick={toggleSort} align="right" />
-              <Th label="Conversion %" sortKey="conversionRate" current={sortKey} dir={sortDir} onClick={toggleSort} align="right" />
+              <Th label="Conversion %" sortKey="newAttendeeConversion" current={sortKey} dir={sortDir} onClick={toggleSort} align="right" />
               <th className="text-left px-4 py-2.5 text-xs font-medium text-walnut">AI</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={7} className="text-center py-8 text-walnut text-sm">
+                <td colSpan={10} className="text-center py-8 text-walnut text-sm">
                   No series match this filter.
                 </td>
               </tr>
@@ -987,13 +1064,16 @@ function SeriesTable({
                             {g.tag}
                           </span>
                         </td>
+                        <td className="px-4 py-2.5 text-right font-semibold text-walnut">{g.instanceCount}</td>
+                        <td className="px-4 py-2.5 text-right font-semibold text-walnut">{g.avgAttendance.toFixed(1)}</td>
                         <td className="px-4 py-2.5 text-right font-semibold text-walnut">{g.totalAttendances}</td>
                         <td className="px-4 py-2.5 text-right font-semibold text-walnut">{g.uniqueAttendees}</td>
+                        <td className="px-4 py-2.5 text-right font-semibold text-walnut">{g.returningMembers}</td>
                         <td className={`px-4 py-2.5 text-right font-semibold ${g.returnRate >= 35 ? 'text-terracotta' : 'text-walnut'}`}>
                           {g.uniqueAttendees > 0 ? `${g.returnRate.toFixed(0)}%` : '—'}
                         </td>
-                        <td className={`px-4 py-2.5 text-right font-semibold ${g.conversionRate !== null && g.conversionRate >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
-                          {g.conversionRate !== null ? `${g.conversionRate.toFixed(0)}%` : 'N/A'}
+                        <td className={`px-4 py-2.5 text-right font-semibold ${g.newAttendeeConversion >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
+                          {g.newAttendeeCount > 0 ? `${g.newAttendeeConversion.toFixed(0)}%` : '—'}
                         </td>
                         <td className="px-4 py-2.5" />
                       </tr>
@@ -1013,13 +1093,16 @@ function SeriesTable({
                                 {s.tag}
                               </span>
                             </td>
+                            <td className="px-4 py-2 text-right text-sm text-walnut">{s.instanceCount}</td>
+                            <td className="px-4 py-2 text-right text-sm text-walnut">{s.avgAttendance.toFixed(1)}</td>
                             <td className="px-4 py-2 text-right text-sm text-walnut">{s.totalAttendances}</td>
                             <td className="px-4 py-2 text-right text-sm text-walnut">{s.uniqueAttendees}</td>
+                            <td className="px-4 py-2 text-right text-sm text-walnut">{s.returningMembers}</td>
                             <td className={`px-4 py-2 text-right text-sm font-medium ${s.returnRate >= 35 ? 'text-terracotta' : 'text-walnut'}`}>
                               {s.uniqueAttendees > 0 ? `${s.returnRate.toFixed(0)}%` : '—'}
                             </td>
-                            <td className={`px-4 py-2 text-right text-sm font-medium ${s.conversionRate !== null && s.conversionRate >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
-                              {s.conversionRate !== null ? `${s.conversionRate.toFixed(0)}%` : 'N/A'}
+                            <td className={`px-4 py-2 text-right text-sm font-medium ${s.newAttendeeConversion >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
+                              {s.newAttendeeCount > 0 ? `${s.newAttendeeConversion.toFixed(0)}%` : '—'}
                             </td>
                             <td className="px-4 py-2">
                               {s.hasEnoughData && !s.isArchived && (
@@ -1051,13 +1134,16 @@ function SeriesTable({
                           {s.tag}
                         </span>
                       </td>
+                      <td className="px-4 py-2.5 text-right text-walnut">{s.instanceCount}</td>
+                      <td className="px-4 py-2.5 text-right text-walnut">{s.avgAttendance.toFixed(1)}</td>
                       <td className="px-4 py-2.5 text-right text-walnut">{s.totalAttendances}</td>
                       <td className="px-4 py-2.5 text-right text-walnut">{s.uniqueAttendees}</td>
+                      <td className="px-4 py-2.5 text-right text-walnut">{s.returningMembers}</td>
                       <td className={`px-4 py-2.5 text-right font-medium ${s.returnRate >= 35 ? 'text-terracotta' : 'text-walnut'}`}>
                         {s.uniqueAttendees > 0 ? `${s.returnRate.toFixed(0)}%` : '—'}
                       </td>
-                      <td className={`px-4 py-2.5 text-right font-medium ${s.conversionRate !== null && s.conversionRate >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
-                        {s.conversionRate !== null ? `${s.conversionRate.toFixed(0)}%` : 'N/A'}
+                      <td className={`px-4 py-2.5 text-right font-medium ${s.newAttendeeConversion >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
+                        {s.newAttendeeCount > 0 ? `${s.newAttendeeConversion.toFixed(0)}%` : '—'}
                       </td>
                       <td className="px-4 py-2.5">
                         {s.hasEnoughData && !s.isArchived ? (
@@ -1075,7 +1161,7 @@ function SeriesTable({
                     </tr>
                     {isOpen && (s.description || rec) && (
                       <tr className="border-b border-cream/60 last:border-0 bg-cream/30">
-                        <td colSpan={7} className="px-4 py-3 text-xs text-walnut leading-relaxed">
+                        <td colSpan={10} className="px-4 py-3 text-xs text-walnut leading-relaxed">
                           {s.description && <p className="mb-1">{s.description}</p>}
                           {rec && <p className="italic">{rec.reason}</p>}
                         </td>
