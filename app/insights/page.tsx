@@ -792,6 +792,88 @@ const tooltipStyle = {
 
 type SeriesSortKey = 'name' | 'totalAttendances' | 'uniqueAttendees' | 'returnRate' | 'conversionRate'
 
+// Category grouping rules — order matters (first match wins)
+const GROUP_RULES: { id: string; label: string; matches: (n: string) => boolean }[] = [
+  { id: 'kirtan',            label: 'Kirtan Events',        matches: n => /kirtan/i.test(n) },
+  { id: 'outdoor-yoga',      label: 'Outdoor Yoga',          matches: n => /outdoor yoga/i.test(n) },
+  { id: 'bhakti-talks',      label: 'Bhakti Talks',          matches: n => /bhakti talks/i.test(n) },
+  { id: 'ayurvedic-cooking', label: 'Ayurvedic Cooking',     matches: n => /ayurved/i.test(n) },
+  { id: 'soul-talks',        label: 'Soul Talks',            matches: n => /^soul talks/i.test(n) },
+]
+
+type SeriesGroup = {
+  id: string
+  label: string
+  tag: EventTag
+  members: SeriesStat[]     // sorted by totalAttendances desc
+  totalAttendances: number
+  uniqueAttendees: number
+  returnRate: number        // weighted average by uniqueAttendees
+  conversionRate: number | null
+}
+
+type TableRow =
+  | { kind: 'group';  data: SeriesGroup }
+  | { kind: 'series'; data: SeriesStat }
+
+function buildRows(stats: SeriesStat[], sortKey: SeriesSortKey, sortDir: SortDir): TableRow[] {
+  const buckets = new Map<string, SeriesStat[]>(GROUP_RULES.map(r => [r.id, []]))
+  const ungrouped: SeriesStat[] = []
+
+  for (const s of stats) {
+    const rule = GROUP_RULES.find(r => r.matches(s.name))
+    if (rule) buckets.get(rule.id)!.push(s)
+    else ungrouped.push(s)
+  }
+
+  const groupRows: TableRow[] = []
+  for (const rule of GROUP_RULES) {
+    const members = buckets.get(rule.id)!
+    if (members.length === 0) continue
+    if (members.length === 1) { ungrouped.push(members[0]); continue }
+
+    const totalAttendances = members.reduce((s, m) => s + m.totalAttendances, 0)
+    const uniqueAttendees  = members.reduce((s, m) => s + m.uniqueAttendees, 0)
+    const returnRate       = uniqueAttendees > 0
+      ? members.reduce((s, m) => s + m.returnRate * m.uniqueAttendees, 0) / uniqueAttendees
+      : 0
+    const convMembers  = members.filter(m => m.conversionRate !== null)
+    const convWeight   = convMembers.reduce((s, m) => s + m.uniqueAttendees, 0)
+    const conversionRate = convMembers.length > 0 && convWeight > 0
+      ? convMembers.reduce((s, m) => s + m.conversionRate! * m.uniqueAttendees, 0) / convWeight
+      : null
+
+    const tagCount = new Map<EventTag, number>()
+    members.forEach(m => tagCount.set(m.tag, (tagCount.get(m.tag) ?? 0) + m.totalAttendances))
+    const tag = [...tagCount.entries()].sort((a, b) => b[1] - a[1])[0][0]
+
+    groupRows.push({
+      kind: 'group',
+      data: {
+        id: rule.id, label: rule.label, tag, members: [...members].sort((a, b) => b.totalAttendances - a.totalAttendances),
+        totalAttendances, uniqueAttendees, returnRate, conversionRate,
+      },
+    })
+  }
+
+  const all: TableRow[] = [
+    ...groupRows,
+    ...ungrouped.map(s => ({ kind: 'series' as const, data: s })),
+  ]
+
+  return all.sort((a, b) => {
+    if (sortKey === 'name') {
+      const aName = a.kind === 'group' ? a.data.label : a.data.name
+      const bName = b.kind === 'group' ? b.data.label : b.data.name
+      const cmp = aName.localeCompare(bName)
+      return sortDir === 'asc' ? cmp : -cmp
+    }
+    const av = sortKey === 'conversionRate' ? (a.data.conversionRate ?? -1) : (a.data[sortKey] as number)
+    const bv = sortKey === 'conversionRate' ? (b.data.conversionRate ?? -1) : (b.data[sortKey] as number)
+    return sortDir === 'asc' ? av - bv : bv - av
+  })
+}
+
 function SeriesTable({
   stats,
   recBySeriesId,
@@ -816,23 +898,23 @@ function SeriesTable({
     }
   }
 
+  // Grouped view when no tag filter; flat view when filtering by tag
   const rows = useMemo(() => {
     let filtered = stats.filter(s => (showArchived ? true : !s.isArchived))
-    if (tagFilter !== 'all') filtered = filtered.filter(s => s.tag === tagFilter)
-
-    const sorted = [...filtered].sort((a, b) => {
-      let cmp = 0
-      if (sortKey === 'name') cmp = a.name.localeCompare(b.name)
-      else if (sortKey === 'conversionRate') {
-        const av = a.conversionRate ?? -1
-        const bv = b.conversionRate ?? -1
-        cmp = av - bv
-      } else {
-        cmp = (a[sortKey] as number) - (b[sortKey] as number)
-      }
-      return sortDir === 'asc' ? cmp : -cmp
-    })
-    return sorted
+    if (tagFilter !== 'all') {
+      filtered = filtered.filter(s => s.tag === tagFilter)
+      // Flat sort for tag-filtered view
+      return filtered.sort((a, b) => {
+        if (sortKey === 'name') {
+          const cmp = a.name.localeCompare(b.name)
+          return sortDir === 'asc' ? cmp : -cmp
+        }
+        const av = sortKey === 'conversionRate' ? (a.conversionRate ?? -1) : (a[sortKey] as number)
+        const bv = sortKey === 'conversionRate' ? (b.conversionRate ?? -1) : (b[sortKey] as number)
+        return sortDir === 'asc' ? av - bv : bv - av
+      }).map(s => ({ kind: 'series' as const, data: s }))
+    }
+    return buildRows(filtered, sortKey, sortDir)
   }, [stats, tagFilter, showArchived, sortKey, sortDir])
 
   return (
@@ -882,16 +964,86 @@ function SeriesTable({
                 </td>
               </tr>
             ) : (
-              rows.map(s => {
+              rows.map(row => {
+                if (row.kind === 'group') {
+                  const g = row.data
+                  const isOpen = expandedId === g.id
+                  return (
+                    <Fragment key={`group-${g.id}`}>
+                      {/* ── Group header row ── */}
+                      <tr
+                        onClick={() => setExpandedId(isOpen ? null : g.id)}
+                        className="border-b border-cream/60 cursor-pointer hover:bg-cream/40 transition-colors bg-walnut/5"
+                      >
+                        <td className="px-4 py-2.5 font-semibold text-espresso">
+                          <span className="inline-flex items-center gap-2">
+                            <span className="text-[10px] text-walnut/50">{isOpen ? '▼' : '▶'}</span>
+                            {g.label}
+                            <span className="text-xs font-normal text-walnut/40">{g.members.length} series</span>
+                          </span>
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <span className={`text-xs font-semibold px-2 py-0.5 rounded-full capitalize ${TAG_STYLES[g.tag]}`}>
+                            {g.tag}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2.5 text-right font-semibold text-walnut">{g.totalAttendances}</td>
+                        <td className="px-4 py-2.5 text-right font-semibold text-walnut">{g.uniqueAttendees}</td>
+                        <td className={`px-4 py-2.5 text-right font-semibold ${g.returnRate >= 35 ? 'text-terracotta' : 'text-walnut'}`}>
+                          {g.uniqueAttendees > 0 ? `${g.returnRate.toFixed(0)}%` : '—'}
+                        </td>
+                        <td className={`px-4 py-2.5 text-right font-semibold ${g.conversionRate !== null && g.conversionRate >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
+                          {g.conversionRate !== null ? `${g.conversionRate.toFixed(0)}%` : 'N/A'}
+                        </td>
+                        <td className="px-4 py-2.5" />
+                      </tr>
+                      {/* ── Expanded member rows ── */}
+                      {isOpen && g.members.map((s, i) => {
+                        const rec = recBySeriesId.get(s.id) ?? null
+                        return (
+                          <tr key={s.id} className={`border-b border-cream/40 last:border-0 bg-cream/25 ${s.isArchived ? 'opacity-60' : ''}`}>
+                            <td className="pl-10 pr-4 py-2 text-espresso">
+                              <span className="inline-flex items-center gap-2">
+                                <span className="text-[10px] font-bold text-walnut/30 w-4 shrink-0 text-right">#{i + 1}</span>
+                                <span className="text-sm">{s.name}</span>
+                              </span>
+                            </td>
+                            <td className="px-4 py-2">
+                              <span className={`text-xs font-semibold px-2 py-0.5 rounded-full capitalize ${TAG_STYLES[s.tag]}`}>
+                                {s.tag}
+                              </span>
+                            </td>
+                            <td className="px-4 py-2 text-right text-sm text-walnut">{s.totalAttendances}</td>
+                            <td className="px-4 py-2 text-right text-sm text-walnut">{s.uniqueAttendees}</td>
+                            <td className={`px-4 py-2 text-right text-sm font-medium ${s.returnRate >= 35 ? 'text-terracotta' : 'text-walnut'}`}>
+                              {s.uniqueAttendees > 0 ? `${s.returnRate.toFixed(0)}%` : '—'}
+                            </td>
+                            <td className={`px-4 py-2 text-right text-sm font-medium ${s.conversionRate !== null && s.conversionRate >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
+                              {s.conversionRate !== null ? `${s.conversionRate.toFixed(0)}%` : 'N/A'}
+                            </td>
+                            <td className="px-4 py-2">
+                              {s.hasEnoughData && !s.isArchived && (
+                                recLoading
+                                  ? <div className="w-3 h-3 border border-walnut/40 border-t-transparent rounded-full animate-spin" />
+                                  : rec ? <AIBadge recommendation={rec} /> : <span className="text-xs text-walnut/40">—</span>
+                              )}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </Fragment>
+                  )
+                }
+
+                // ── Individual (ungrouped) series row ──
+                const s = row.data
                 const rec = recBySeriesId.get(s.id) ?? null
                 const isOpen = expandedId === s.id
                 return (
                   <Fragment key={s.id}>
                     <tr
                       onClick={() => setExpandedId(isOpen ? null : s.id)}
-                      className={`border-b border-cream/60 last:border-0 cursor-pointer hover:bg-cream/40 transition-colors ${
-                        s.isArchived ? 'opacity-60' : ''
-                      }`}
+                      className={`border-b border-cream/60 last:border-0 cursor-pointer hover:bg-cream/40 transition-colors ${s.isArchived ? 'opacity-60' : ''}`}
                     >
                       <td className="px-4 py-2.5 font-medium text-espresso">{s.name}</td>
                       <td className="px-4 py-2.5">
@@ -901,20 +1053,10 @@ function SeriesTable({
                       </td>
                       <td className="px-4 py-2.5 text-right text-walnut">{s.totalAttendances}</td>
                       <td className="px-4 py-2.5 text-right text-walnut">{s.uniqueAttendees}</td>
-                      <td
-                        className={`px-4 py-2.5 text-right font-medium ${
-                          s.returnRate >= 35 ? 'text-terracotta' : 'text-walnut'
-                        }`}
-                      >
+                      <td className={`px-4 py-2.5 text-right font-medium ${s.returnRate >= 35 ? 'text-terracotta' : 'text-walnut'}`}>
                         {s.uniqueAttendees > 0 ? `${s.returnRate.toFixed(0)}%` : '—'}
                       </td>
-                      <td
-                        className={`px-4 py-2.5 text-right font-medium ${
-                          s.conversionRate !== null && s.conversionRate >= 20
-                            ? 'text-terracotta'
-                            : 'text-walnut/60'
-                        }`}
-                      >
+                      <td className={`px-4 py-2.5 text-right font-medium ${s.conversionRate !== null && s.conversionRate >= 20 ? 'text-terracotta' : 'text-walnut/60'}`}>
                         {s.conversionRate !== null ? `${s.conversionRate.toFixed(0)}%` : 'N/A'}
                       </td>
                       <td className="px-4 py-2.5">
