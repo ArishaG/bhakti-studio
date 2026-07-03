@@ -77,6 +77,7 @@ type InstanceStat = {
   date: string
   instructorName: string | null
   seriesName: string
+  seriesId: string
   tag: EventTag
   totalCheckins: number
   uniqueAttendees: number
@@ -336,6 +337,7 @@ function computeInstanceStats(
       date: inst.date,
       instructorName: inst.instructor_name,
       seriesName: inst.event_series?.name ?? 'Unknown',
+      seriesId: inst.series_id,
       tag: inst.event_series?.tag ?? 'other',
       totalCheckins: atts.length,
       uniqueAttendees: uniquePersons.size,
@@ -479,6 +481,7 @@ export default function InsightsPage() {
   const [growthRange, setGrowthRange] = useState<[number, number] | null>(null)
   const [monthlyRange, setMonthlyRange] = useState<[number, number] | null>(null)
   const [showAllSeries, setShowAllSeries] = useState(false)
+  const [showOrganizer, setShowOrganizer] = useState(false)
 
   useEffect(() => {
     loadData()
@@ -820,8 +823,17 @@ export default function InsightsPage() {
             {/* ── Series Performance Table ── */}
             <SeriesTable stats={seriesStats} recBySeriesId={recBySeriesId} recLoading={recLoading} />
 
-            {/* ── Event Instances Table ── */}
-            <InstanceTable instances={instanceStats} />
+            {/* ── Event Instances / Organizer ── */}
+            {showOrganizer ? (
+              <SeriesOrganizer
+                instances={instanceStats}
+                allSeries={seriesStats}
+                onClose={() => setShowOrganizer(false)}
+                onRefresh={loadData}
+              />
+            ) : (
+              <InstanceTable instances={instanceStats} onOrganize={() => setShowOrganizer(true)} />
+            )}
           </>
         )}
       </div>
@@ -1213,7 +1225,7 @@ function Th<K extends string>({
 
 type InstanceSortKey = 'date' | 'totalCheckins' | 'uniqueAttendees'
 
-function InstanceTable({ instances }: { instances: InstanceStat[] }) {
+function InstanceTable({ instances, onOrganize }: { instances: InstanceStat[]; onOrganize?: () => void }) {
   const [tagFilter, setTagFilter] = useState<EventTag | 'all'>('all')
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<InstanceSortKey>('date')
@@ -1259,6 +1271,14 @@ function InstanceTable({ instances }: { instances: InstanceStat[] }) {
           <span className="ml-2 text-sm font-normal text-walnut">({filtered.length})</span>
         </h2>
         <div className="flex items-center gap-2 flex-wrap">
+          {onOrganize && (
+            <button
+              onClick={onOrganize}
+              className="text-xs font-medium px-3 py-1.5 rounded-full bg-espresso text-cream hover:bg-walnut transition-colors"
+            >
+              Organize
+            </button>
+          )}
           <input
             type="text"
             placeholder="Search series or instructor…"
@@ -1333,6 +1353,285 @@ function InstanceTable({ instances }: { instances: InstanceStat[] }) {
           Show all {filtered.length} events →
         </button>
       )}
+    </section>
+  )
+}
+
+// ─── Series Organizer ────────────────────────────────────────────────────────────
+
+function SeriesOrganizer({
+  instances,
+  allSeries,
+  onClose,
+  onRefresh,
+}: {
+  instances: InstanceStat[]
+  allSeries: SeriesStat[]
+  onClose: () => void
+  onRefresh: () => void
+}) {
+  const supabase = useMemo(() => createClient(), [])
+
+  const [draggedId, setDraggedId] = useState<string | null>(null)
+  const [hoverSeriesId, setHoverSeriesId] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+  const [localMoves, setLocalMoves] = useState<Map<string, string>>(new Map())
+  const [newSeriesName, setNewSeriesName] = useState('')
+  const [newSeriesTag, setNewSeriesTag] = useState<EventTag>('other')
+  const [creating, setCreating] = useState(false)
+  const [saving, setSaving] = useState<Set<string>>(new Set())
+  const [errors, setErrors] = useState<Map<string, string>>(new Map())
+  const [createdSeries, setCreatedSeries] = useState<Array<{ id: string; name: string; tag: EventTag }>>([])
+
+  function effectiveSeriesId(inst: InstanceStat): string {
+    return localMoves.get(inst.id) ?? inst.seriesId
+  }
+
+  function effectiveSeriesName(inst: InstanceStat): string {
+    const sid = effectiveSeriesId(inst)
+    if (sid === inst.seriesId) return inst.seriesName
+    const found = allSeries.find(s => s.id === sid) ?? createdSeries.find(s => s.id === sid)
+    return found?.name ?? inst.seriesName
+  }
+
+  const filteredInstances = useMemo(() => {
+    let rows = instances
+    if (search.trim()) {
+      const q = search.toLowerCase()
+      rows = rows.filter(i =>
+        i.seriesName.toLowerCase().includes(q) ||
+        i.date.includes(q) ||
+        (i.instructorName?.toLowerCase().includes(q) ?? false)
+      )
+    }
+    return [...rows].sort((a, b) => b.date.localeCompare(a.date))
+  }, [instances, search])
+
+  const allDropTargets = useMemo(() => {
+    const fromStats = allSeries.filter(s => !s.isArchived).map(s => ({
+      id: s.id, name: s.name, tag: s.tag,
+    }))
+    const seen = new Set<string>()
+    return [...fromStats, ...createdSeries]
+      .filter(s => { if (seen.has(s.id)) return false; seen.add(s.id); return true })
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }, [allSeries, createdSeries])
+
+  const countBySeries = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const inst of instances) {
+      const sid = localMoves.get(inst.id) ?? inst.seriesId
+      m.set(sid, (m.get(sid) ?? 0) + 1)
+    }
+    return m
+  }, [instances, localMoves])
+
+  async function moveInstance(instanceId: string, targetSeriesId: string) {
+    setLocalMoves(prev => new Map(prev).set(instanceId, targetSeriesId))
+    setSaving(prev => new Set(prev).add(instanceId))
+    setErrors(prev => { const m = new Map(prev); m.delete(instanceId); return m })
+
+    const { error } = await supabase
+      .from('event_instances')
+      .update({ series_id: targetSeriesId })
+      .eq('id', instanceId)
+
+    setSaving(prev => { const s = new Set(prev); s.delete(instanceId); return s })
+
+    if (error) {
+      setLocalMoves(prev => { const m = new Map(prev); m.delete(instanceId); return m })
+      setErrors(prev => new Map(prev).set(instanceId, error.message))
+    }
+  }
+
+  async function createSeries() {
+    const name = newSeriesName.trim()
+    if (!name || creating) return
+    setCreating(true)
+
+    const { data, error } = await supabase
+      .from('event_series')
+      .insert({ name, tag: newSeriesTag, description: null, is_archived: false })
+      .select('id, name, tag')
+      .single()
+
+    setCreating(false)
+    if (error) {
+      alert(`Failed to create series: ${error.message}`)
+      return
+    }
+    setCreatedSeries(prev => [...prev, { id: data.id, name: data.name, tag: data.tag as EventTag }])
+    setNewSeriesName('')
+    onRefresh()
+  }
+
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-lg font-semibold text-espresso">Organize Events</h2>
+        <button
+          onClick={onClose}
+          className="text-xs font-medium px-3 py-1.5 rounded-full bg-parchment text-walnut hover:bg-walnut/10 transition-colors"
+        >
+          ← Back to Events
+        </button>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+        {/* Left: Events list */}
+        <div className="lg:col-span-3 bg-parchment rounded-2xl p-4">
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-sm font-semibold text-espresso">
+              All Events
+              <span className="ml-2 text-xs font-normal text-walnut">({instances.length})</span>
+            </p>
+            <span className="text-[10px] text-walnut/50">drag to reassign →</span>
+          </div>
+
+          <input
+            type="text"
+            placeholder="Search by series, date, or instructor…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            className="w-full text-xs bg-cream border border-walnut/20 rounded-lg px-3 py-2 mb-3 focus:outline-none focus:ring-1 focus:ring-walnut/30"
+          />
+
+          <div className="space-y-0.5 max-h-[70vh] overflow-y-auto">
+            {filteredInstances.map(inst => {
+              const moved = localMoves.has(inst.id)
+              const isSaving = saving.has(inst.id)
+              const err = errors.get(inst.id)
+              const sName = effectiveSeriesName(inst)
+              return (
+                <div
+                  key={inst.id}
+                  draggable
+                  onDragStart={e => {
+                    setDraggedId(inst.id)
+                    e.dataTransfer.setData('text/plain', inst.id)
+                    e.dataTransfer.effectAllowed = 'move'
+                  }}
+                  onDragEnd={() => setDraggedId(null)}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-lg select-none transition-opacity cursor-grab active:cursor-grabbing ${
+                    draggedId === inst.id ? 'opacity-30' : 'hover:bg-cream/60'
+                  }`}
+                >
+                  <span className="text-walnut/25 shrink-0">⠿</span>
+                  <div className="min-w-0 flex-1">
+                    <p className={`text-xs font-medium truncate ${moved ? 'text-terracotta' : 'text-espresso'}`}>
+                      {sName}
+                    </p>
+                    <p className="text-[10px] text-walnut/50 truncate">
+                      {new Date(inst.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                      {inst.instructorName ? ` · ${inst.instructorName}` : ''}
+                      {` · ${inst.totalCheckins} check-in${inst.totalCheckins !== 1 ? 's' : ''}`}
+                    </p>
+                    {err && <p className="text-[10px] text-red-500 mt-0.5 truncate">{err}</p>}
+                  </div>
+                  {isSaving ? (
+                    <div className="w-3 h-3 border border-walnut/40 border-t-transparent rounded-full animate-spin shrink-0" />
+                  ) : moved ? (
+                    <span className="text-[10px] text-terracotta font-medium shrink-0">moved</span>
+                  ) : null}
+                </div>
+              )
+            })}
+            {filteredInstances.length === 0 && (
+              <p className="text-xs text-walnut/40 text-center py-6">No events match.</p>
+            )}
+          </div>
+        </div>
+
+        {/* Right: Create series + drop zones */}
+        <div className="lg:col-span-2 space-y-3">
+          {/* Create new series */}
+          <div className="bg-parchment rounded-2xl p-4">
+            <p className="text-sm font-semibold text-espresso mb-3">Create New Series</p>
+            <form onSubmit={e => { e.preventDefault(); createSeries() }} className="space-y-2">
+              <input
+                type="text"
+                placeholder="Series name…"
+                value={newSeriesName}
+                onChange={e => setNewSeriesName(e.target.value)}
+                className="w-full text-xs bg-cream border border-walnut/20 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-walnut/30"
+              />
+              <div className="flex gap-2">
+                <select
+                  value={newSeriesTag}
+                  onChange={e => setNewSeriesTag(e.target.value as EventTag)}
+                  className="flex-1 text-xs bg-cream border border-walnut/20 rounded-lg px-3 py-2 focus:outline-none"
+                >
+                  {ALL_TAGS.map(t => (
+                    <option key={t} value={t}>{TAG_LABEL[t]}</option>
+                  ))}
+                </select>
+                <button
+                  type="submit"
+                  disabled={!newSeriesName.trim() || creating}
+                  className="text-xs font-medium px-4 py-2 rounded-lg bg-espresso text-cream disabled:opacity-40 transition-opacity"
+                >
+                  {creating ? '…' : 'Create'}
+                </button>
+              </div>
+            </form>
+          </div>
+
+          {/* Series drop zones */}
+          <div className="bg-parchment rounded-2xl p-4">
+            <p className="text-sm font-semibold text-espresso mb-3">
+              Series
+              <span className="ml-2 text-xs font-normal text-walnut">({allDropTargets.length})</span>
+            </p>
+            <div className="space-y-0.5 max-h-[60vh] overflow-y-auto">
+              {allDropTargets.map(series => {
+                const isOver = hoverSeriesId === series.id
+                const count = countBySeries.get(series.id) ?? 0
+                return (
+                  <div
+                    key={series.id}
+                    onDragOver={e => {
+                      e.preventDefault()
+                      e.dataTransfer.dropEffect = 'move'
+                      setHoverSeriesId(series.id)
+                    }}
+                    onDragLeave={e => {
+                      if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                        setHoverSeriesId(null)
+                      }
+                    }}
+                    onDrop={e => {
+                      e.preventDefault()
+                      const instanceId = e.dataTransfer.getData('text/plain')
+                      if (instanceId) moveInstance(instanceId, series.id)
+                      setHoverSeriesId(null)
+                    }}
+                    className={`flex items-center justify-between px-3 py-2 rounded-lg transition-all border-2 ${
+                      isOver
+                        ? 'border-gold bg-gold/10'
+                        : 'border-transparent hover:bg-cream/60'
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-medium text-espresso truncate">{series.name}</p>
+                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full capitalize ${TAG_STYLES[series.tag]}`}>
+                        {series.tag}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0 ml-2">
+                      {count > 0 && (
+                        <span className="text-[10px] text-walnut/50">{count}</span>
+                      )}
+                      {isOver && draggedId && (
+                        <span className="text-[10px] text-gold font-semibold">drop</span>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
   )
 }
