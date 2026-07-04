@@ -1029,7 +1029,8 @@ function SeriesTable({
         </div>
       </div>
 
-      <div className="bg-parchment rounded-2xl overflow-x-auto">
+      <div className="bg-parchment rounded-2xl">
+        <div className="overflow-x-auto">
         <table className="w-full text-sm min-w-[900px]">
           <thead className="sticky top-16 z-10 bg-parchment">
             <tr className="border-b border-cream/80">
@@ -1185,6 +1186,7 @@ function SeriesTable({
             )}
           </tbody>
         </table>
+        </div>
       </div>
     </section>
   )
