@@ -1437,7 +1437,29 @@ function SeriesOrganizer({
   const [createdSeries, setCreatedSeries] = useState<Array<{ id: string; name: string; tag: EventTag }>>([])
   const originalSeriesRef = useRef<Map<string, string>>(new Map())
 
-  const { dropTargets, groupedSeriesIds, targetSeriesIds } = useMemo(() => {
+  // Snapshot which series are "sorted" at mount time — never changes during the session.
+  // This prevents allSeries changes (e.g. creating a new series that forms a group) from
+  // silently moving events out of the unsorted pool without user action.
+  const [initialSortedSeriesIds] = useState<Set<string>>(() => {
+    const buckets = new Map<string, SeriesStat[]>(GROUP_RULES.map(r => [r.id, []]))
+    const ungrouped: SeriesStat[] = []
+    for (const s of allSeries.filter(s => !s.isArchived)) {
+      const rule = GROUP_RULES.find(r => r.matches(s.name))
+      if (rule) buckets.get(rule.id)!.push(s)
+      else ungrouped.push(s)
+    }
+    const sorted = new Set<string>()
+    for (const rule of GROUP_RULES) {
+      const members = buckets.get(rule.id)!
+      if (members.length >= 2) members.forEach(m => sorted.add(m.id))
+    }
+    for (const s of ungrouped) {
+      if (s.instanceCount >= 2) sorted.add(s.id)
+    }
+    return sorted
+  })
+
+  const dropTargets = useMemo(() => {
     const buckets = new Map<string, SeriesStat[]>(GROUP_RULES.map(r => [r.id, []]))
     const ungrouped: SeriesStat[] = []
 
@@ -1448,21 +1470,18 @@ function SeriesOrganizer({
     }
 
     const targets: OrgTarget[] = []
-    const groupedIds = new Set<string>()
 
     for (const rule of GROUP_RULES) {
       const members = buckets.get(rule.id)!
-      if (members.length < 2) continue  // singletons: their events stay in the unsorted pool
+      if (members.length < 2) continue
       const sorted = [...members].sort((a, b) => b.totalAttendances - a.totalAttendances)
       const memberIds = sorted.map(m => m.id)
-      memberIds.forEach(id => groupedIds.add(id))
       const tagTotals = new Map<EventTag, number>()
       members.forEach(m => tagTotals.set(m.tag, (tagTotals.get(m.tag) ?? 0) + m.totalAttendances))
       const tag = [...tagTotals.entries()].sort((a, b) => b[1] - a[1])[0][0]
       targets.push({ kind: 'group', id: rule.id, label: rule.label, tag, assignSeriesId: sorted[0].id, memberIds })
     }
 
-    // Ungrouped individual series — only show as targets if they have 2+ events
     const seen = new Set<string>()
     for (const s of ungrouped) {
       if (seen.has(s.id)) continue
@@ -1472,7 +1491,7 @@ function SeriesOrganizer({
       }
     }
 
-    // Always show newly created series as targets (they start with 0 events so bypass the >= 2 filter)
+    // Always show newly created series as targets (bypass instanceCount >= 2 filter)
     const addedTargetIds = new Set(targets.map(t => t.id))
     for (const s of createdSeries) {
       if (!addedTargetIds.has(s.id)) {
@@ -1482,14 +1501,7 @@ function SeriesOrganizer({
     }
 
     targets.sort((a, b) => a.label.localeCompare(b.label))
-
-    // Series IDs of individual (non-group) right-panel targets — their events should NOT appear in unsorted
-    const targetSids = new Set<string>()
-    for (const t of targets) {
-      if (t.kind === 'series') targetSids.add(t.assignSeriesId)
-    }
-
-    return { dropTargets: targets, groupedSeriesIds: groupedIds, targetSeriesIds: targetSids }
+    return targets
   }, [allSeries, createdSeries])
 
   // Count events visually assigned to each series (for divider badges)
@@ -1497,15 +1509,15 @@ function SeriesOrganizer({
     const m = new Map<string, number>()
     for (const inst of instances) {
       const p = placements.get(inst.id)
-      if (p === UNSORTED_MARKER) continue  // explicitly unsorted
+      if (p === UNSORTED_MARKER) continue
       if (p !== undefined) {
-        m.set(p, (m.get(p) ?? 0) + 1)  // explicitly moved to this series
-      } else if (groupedSeriesIds.has(inst.seriesId) || targetSeriesIds.has(inst.seriesId)) {
-        m.set(inst.seriesId, (m.get(inst.seriesId) ?? 0) + 1)  // naturally in a group or individual target
+        m.set(p, (m.get(p) ?? 0) + 1)
+      } else if (initialSortedSeriesIds.has(inst.seriesId)) {
+        m.set(inst.seriesId, (m.get(inst.seriesId) ?? 0) + 1)
       }
     }
     return m
-  }, [instances, placements, groupedSeriesIds, targetSeriesIds])
+  }, [instances, placements, initialSortedSeriesIds])
 
   function getTargetCount(target: OrgTarget): number {
     if (target.kind === 'series') return countBySeries.get(target.assignSeriesId) ?? 0
@@ -1516,11 +1528,12 @@ function SeriesOrganizer({
     return instances
       .filter(inst => {
         const p = placements.get(inst.id)
-        if (p === UNSORTED_MARKER) return false  // explicitly unsorted
+        if (p === UNSORTED_MARKER) return false
         if (p !== undefined) {
           return target.kind === 'series' ? p === target.assignSeriesId : target.memberIds.includes(p)
         }
-        // Natural position
+        // Natural position: only if sorted at mount time
+        if (!initialSortedSeriesIds.has(inst.seriesId)) return false
         return target.kind === 'series'
           ? inst.seriesId === target.assignSeriesId
           : target.memberIds.includes(inst.seriesId)
@@ -1533,10 +1546,9 @@ function SeriesOrganizer({
     return instances
       .filter(inst => {
         const p = placements.get(inst.id)
-        if (p === UNSORTED_MARKER) return true   // explicitly pulled to unsorted
-        if (p !== undefined) return false         // moved to a specific series
-        // Naturally sorted = in a group target or an individual series target
-        return !groupedSeriesIds.has(inst.seriesId) && !targetSeriesIds.has(inst.seriesId)
+        if (p === UNSORTED_MARKER) return true
+        if (p !== undefined) return false
+        return !initialSortedSeriesIds.has(inst.seriesId)
       })
       .filter(inst =>
         !q ||
@@ -1545,7 +1557,7 @@ function SeriesOrganizer({
         (inst.instructorName?.toLowerCase().includes(q) ?? false)
       )
       .sort((a, b) => b.date.localeCompare(a.date))
-  }, [instances, groupedSeriesIds, targetSeriesIds, placements, search])
+  }, [instances, initialSortedSeriesIds, placements, search])
 
   async function moveInstance(instanceId: string, assignSeriesId: string) {
     if (!originalSeriesRef.current.has(instanceId)) {
@@ -1593,6 +1605,16 @@ function SeriesOrganizer({
   }
 
   async function archiveSeries(seriesId: string) {
+    // Move all events in this series to unsorted before hiding it
+    setPlacements(prev => {
+      const m = new Map(prev)
+      for (const inst of instances) {
+        const p = m.get(inst.id)
+        const effectiveSid = (p !== undefined && p !== UNSORTED_MARKER) ? p : inst.seriesId
+        if (effectiveSid === seriesId) m.set(inst.id, UNSORTED_MARKER)
+      }
+      return m
+    })
     await supabase.from('event_series').update({ is_archived: true }).eq('id', seriesId)
     onRefresh()
   }
