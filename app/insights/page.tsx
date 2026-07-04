@@ -986,7 +986,7 @@ function SeriesTable({
 
   // Grouped view when no tag filter; flat view when filtering by tag
   const rows = useMemo(() => {
-    let filtered = stats.filter(s => (showArchived ? true : !s.isArchived))
+    let filtered = stats.filter(s => (showArchived ? true : !s.isArchived) && s.instanceCount >= 2)
     if (tagFilter !== 'all') {
       filtered = filtered.filter(s => s.tag === tagFilter)
       // Flat sort for tag-filtered view
@@ -1363,6 +1363,8 @@ type OrgTarget =
   | { kind: 'group'; id: string; label: string; tag: EventTag; assignSeriesId: string; memberIds: string[] }
   | { kind: 'series'; id: string; label: string; tag: EventTag; assignSeriesId: string }
 
+const UNSORTED_DROP_ID = '__unsorted__'
+
 function SeriesOrganizer({
   instances,
   allSeries,
@@ -1378,6 +1380,7 @@ function SeriesOrganizer({
 
   const [draggedId, setDraggedId] = useState<string | null>(null)
   const [hoverTargetId, setHoverTargetId] = useState<string | null>(null)
+  const [expandedTargetId, setExpandedTargetId] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [localMoves, setLocalMoves] = useState<Map<string, string>>(new Map())
   const [newSeriesName, setNewSeriesName] = useState('')
@@ -1386,6 +1389,10 @@ function SeriesOrganizer({
   const [saving, setSaving] = useState<Set<string>>(new Set())
   const [errors, setErrors] = useState<Map<string, string>>(new Map())
   const [createdSeries, setCreatedSeries] = useState<Array<{ id: string; name: string; tag: EventTag }>>([])
+  // Events explicitly pulled back into the unsorted pool (no DB change yet)
+  const [forceUnsorted, setForceUnsorted] = useState<Set<string>>(new Set())
+  // Tracks the original series_id before the first local move (for revert support)
+  const originalSeriesRef = useRef<Map<string, string>>(new Map())
 
   // Build group / individual drop targets from GROUP_RULES + allSeries
   const { dropTargets, groupedSeriesIds } = useMemo(() => {
@@ -1416,7 +1423,6 @@ function SeriesOrganizer({
       targets.push({ kind: 'group', id: rule.id, label: rule.label, tag, assignSeriesId: sorted[0].id, memberIds })
     }
 
-    // Deduplicate ungrouped then sort
     const seen = new Set<string>()
     for (const s of ungrouped) {
       if (seen.has(s.id)) continue
@@ -1424,7 +1430,6 @@ function SeriesOrganizer({
       targets.push({ kind: 'series', id: s.id, label: s.name, tag: s.tag, assignSeriesId: s.id })
     }
 
-    // Newly created series not yet in allSeries
     const existingIds = new Set(allSeries.map(s => s.id))
     for (const s of createdSeries) {
       if (!existingIds.has(s.id)) {
@@ -1436,7 +1441,6 @@ function SeriesOrganizer({
     return { dropTargets: targets, groupedSeriesIds: groupedIds }
   }, [allSeries, createdSeries])
 
-  // Count instances per series (local moves applied)
   const countBySeries = useMemo(() => {
     const m = new Map<string, number>()
     for (const inst of instances) {
@@ -1451,11 +1455,23 @@ function SeriesOrganizer({
     return target.memberIds.reduce((sum, sid) => sum + (countBySeries.get(sid) ?? 0), 0)
   }
 
-  // Left panel: only events not already in a recognized group, not yet moved this session
+  function getTargetInstances(target: OrgTarget): InstanceStat[] {
+    return instances
+      .filter(inst => {
+        if (forceUnsorted.has(inst.id)) return false
+        const sid = localMoves.get(inst.id) ?? inst.seriesId
+        return target.kind === 'series' ? sid === target.assignSeriesId : target.memberIds.includes(sid)
+      })
+      .sort((a, b) => b.date.localeCompare(a.date))
+  }
+
   const unsortedInstances = useMemo(() => {
     const q = search.trim().toLowerCase()
     return instances
-      .filter(inst => !localMoves.has(inst.id) && !groupedSeriesIds.has(inst.seriesId))
+      .filter(inst =>
+        forceUnsorted.has(inst.id) ||
+        (!localMoves.has(inst.id) && !groupedSeriesIds.has(inst.seriesId))
+      )
       .filter(inst =>
         !q ||
         inst.seriesName.toLowerCase().includes(q) ||
@@ -1463,9 +1479,16 @@ function SeriesOrganizer({
         (inst.instructorName?.toLowerCase().includes(q) ?? false)
       )
       .sort((a, b) => b.date.localeCompare(a.date))
-  }, [instances, groupedSeriesIds, localMoves, search])
+  }, [instances, groupedSeriesIds, localMoves, forceUnsorted, search])
 
   async function moveInstance(instanceId: string, assignSeriesId: string) {
+    // Lift out of force-unsorted if it was placed there
+    setForceUnsorted(prev => { const s = new Set(prev); s.delete(instanceId); return s })
+    // Track original series before first move (for revert)
+    if (!originalSeriesRef.current.has(instanceId)) {
+      const inst = instances.find(i => i.id === instanceId)
+      if (inst) originalSeriesRef.current.set(instanceId, inst.seriesId)
+    }
     setLocalMoves(prev => new Map(prev).set(instanceId, assignSeriesId))
     setSaving(prev => new Set(prev).add(instanceId))
     setErrors(prev => { const m = new Map(prev); m.delete(instanceId); return m })
@@ -1483,6 +1506,53 @@ function SeriesOrganizer({
     } else {
       onRefresh()
     }
+  }
+
+  async function revertInstance(instanceId: string) {
+    if (localMoves.has(instanceId)) {
+      // Was moved this session — revert DB and remove local move
+      const originalSid = originalSeriesRef.current.get(instanceId)
+      setLocalMoves(prev => { const m = new Map(prev); m.delete(instanceId); return m })
+      originalSeriesRef.current.delete(instanceId)
+      if (originalSid) {
+        await supabase.from('event_instances').update({ series_id: originalSid }).eq('id', instanceId)
+        onRefresh()
+      }
+    } else {
+      // In group from original DB assignment — place in unsorted locally (no DB change yet)
+      setForceUnsorted(prev => new Set(prev).add(instanceId))
+    }
+  }
+
+  async function archiveSeries(seriesId: string) {
+    await supabase.from('event_series').update({ is_archived: true }).eq('id', seriesId)
+    onRefresh()
+  }
+
+  async function deleteSeries(seriesId: string) {
+    // Collect instances moved to this series before clearing state
+    const movedHere = [...localMoves.entries()]
+      .filter(([, sid]) => sid === seriesId)
+      .map(([instId]) => instId)
+
+    // Revert local state
+    setLocalMoves(prev => {
+      const m = new Map(prev)
+      movedHere.forEach(id => m.delete(id))
+      return m
+    })
+
+    // Revert DB for any events moved here
+    const toRevert = instances.filter(i => movedHere.includes(i.id))
+    await Promise.all(toRevert.map(i => {
+      const orig = originalSeriesRef.current.get(i.id) ?? i.seriesId
+      originalSeriesRef.current.delete(i.id)
+      return supabase.from('event_instances').update({ series_id: orig }).eq('id', i.id)
+    }))
+
+    await supabase.from('event_series').delete().eq('id', seriesId)
+    setCreatedSeries(prev => prev.filter(s => s.id !== seriesId))
+    onRefresh()
   }
 
   async function createSeries() {
@@ -1503,7 +1573,46 @@ function SeriesOrganizer({
     onRefresh()
   }
 
+  function startDrag(e: React.DragEvent, instanceId: string) {
+    // Ensure we have the original series tracked before any move
+    if (!originalSeriesRef.current.has(instanceId)) {
+      const inst = instances.find(i => i.id === instanceId)
+      if (inst) originalSeriesRef.current.set(instanceId, inst.seriesId)
+    }
+    setDraggedId(instanceId)
+    e.dataTransfer.setData('text/plain', instanceId)
+    e.dataTransfer.effectAllowed = 'move'
+  }
+
+  function EventRow({ inst, indent = false }: { inst: InstanceStat; indent?: boolean }) {
+    const isSaving = saving.has(inst.id)
+    const err = errors.get(inst.id)
+    return (
+      <div
+        draggable
+        onDragStart={e => startDrag(e, inst.id)}
+        onDragEnd={() => setDraggedId(null)}
+        className={`flex items-center gap-2 px-3 py-2 rounded-lg select-none cursor-grab active:cursor-grabbing transition-opacity ${
+          indent ? 'ml-4 bg-cream/40 hover:bg-cream/80' : 'hover:bg-cream/60'
+        } ${draggedId === inst.id ? 'opacity-30' : ''}`}
+      >
+        <span className="text-walnut/25 shrink-0 text-xs">⠿</span>
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-medium truncate text-espresso">{inst.seriesName}</p>
+          <p className="text-[10px] text-walnut/50 truncate">
+            {new Date(inst.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+            {inst.instructorName ? ` · ${inst.instructorName}` : ''}
+            {` · ${inst.totalCheckins} check-in${inst.totalCheckins !== 1 ? 's' : ''}`}
+          </p>
+          {err && <p className="text-[10px] text-red-500 mt-0.5 truncate">{err}</p>}
+        </div>
+        {isSaving && <div className="w-2.5 h-2.5 border border-walnut/40 border-t-transparent rounded-full animate-spin shrink-0" />}
+      </div>
+    )
+  }
+
   const movedCount = localMoves.size
+  const createdIds = new Set(createdSeries.map(s => s.id))
 
   return (
     <section>
@@ -1523,14 +1632,28 @@ function SeriesOrganizer({
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-        {/* Left: Unsorted events */}
-        <div className="lg:col-span-3 bg-parchment rounded-2xl p-4">
+        {/* Left: Unsorted events — also a drop target for reverting */}
+        <div
+          className={`lg:col-span-3 bg-parchment rounded-2xl p-4 border-2 transition-colors ${
+            hoverTargetId === UNSORTED_DROP_ID ? 'border-walnut/30' : 'border-transparent'
+          }`}
+          onDragOver={e => { e.preventDefault(); setHoverTargetId(UNSORTED_DROP_ID) }}
+          onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setHoverTargetId(null) }}
+          onDrop={e => {
+            e.preventDefault()
+            const instanceId = e.dataTransfer.getData('text/plain')
+            if (instanceId) revertInstance(instanceId)
+            setHoverTargetId(null)
+          }}
+        >
           <div className="flex items-center justify-between mb-3">
             <p className="text-sm font-semibold text-espresso">
               Unsorted Events
               <span className="ml-2 text-xs font-normal text-walnut">({unsortedInstances.length})</span>
             </p>
-            <span className="text-[10px] text-walnut/50">drag to a series →</span>
+            <span className="text-[10px] text-walnut/50">
+              {hoverTargetId === UNSORTED_DROP_ID && draggedId ? 'drop to unassign' : 'drag to a series →'}
+            </span>
           </div>
 
           <input
@@ -1542,39 +1665,7 @@ function SeriesOrganizer({
           />
 
           <div className="space-y-0.5 max-h-[70vh] overflow-y-auto">
-            {unsortedInstances.map(inst => {
-              const isSaving = saving.has(inst.id)
-              const err = errors.get(inst.id)
-              return (
-                <div
-                  key={inst.id}
-                  draggable
-                  onDragStart={e => {
-                    setDraggedId(inst.id)
-                    e.dataTransfer.setData('text/plain', inst.id)
-                    e.dataTransfer.effectAllowed = 'move'
-                  }}
-                  onDragEnd={() => setDraggedId(null)}
-                  className={`flex items-center gap-2 px-3 py-2 rounded-lg select-none transition-opacity cursor-grab active:cursor-grabbing ${
-                    draggedId === inst.id ? 'opacity-30' : 'hover:bg-cream/60'
-                  }`}
-                >
-                  <span className="text-walnut/25 shrink-0">⠿</span>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-xs font-medium truncate text-espresso">{inst.seriesName}</p>
-                    <p className="text-[10px] text-walnut/50 truncate">
-                      {new Date(inst.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
-                      {inst.instructorName ? ` · ${inst.instructorName}` : ''}
-                      {` · ${inst.totalCheckins} check-in${inst.totalCheckins !== 1 ? 's' : ''}`}
-                    </p>
-                    {err && <p className="text-[10px] text-red-500 mt-0.5 truncate">{err}</p>}
-                  </div>
-                  {isSaving && (
-                    <div className="w-3 h-3 border border-walnut/40 border-t-transparent rounded-full animate-spin shrink-0" />
-                  )}
-                </div>
-              )
-            })}
+            {unsortedInstances.map(inst => <EventRow key={inst.id} inst={inst} />)}
             {unsortedInstances.length === 0 && (
               <p className="text-xs text-walnut/40 text-center py-8">
                 {search.trim() ? 'No events match.' : '✓ All events are sorted!'}
@@ -1583,9 +1674,9 @@ function SeriesOrganizer({
           </div>
         </div>
 
-        {/* Right: Create series + drop targets */}
+        {/* Right: Create series + expandable drop targets */}
         <div className="lg:col-span-2 space-y-3">
-          {/* Create new series */}
+          {/* Create new series (becomes a new divider/bucket) */}
           <div className="bg-parchment rounded-2xl p-4">
             <p className="text-sm font-semibold text-espresso mb-3">Create New Series</p>
             <form onSubmit={e => { e.preventDefault(); createSeries() }} className="space-y-2">
@@ -1617,57 +1708,100 @@ function SeriesOrganizer({
             </form>
           </div>
 
-          {/* Series & group drop targets (mirrors Series Performance grouping) */}
+          {/* Expandable series / group dividers */}
           <div className="bg-parchment rounded-2xl p-4">
             <p className="text-sm font-semibold text-espresso mb-3">
               Series & Groups
               <span className="ml-2 text-xs font-normal text-walnut">({dropTargets.length})</span>
             </p>
-            <div className="space-y-0.5 max-h-[65vh] overflow-y-auto">
+            <div className="space-y-1 max-h-[65vh] overflow-y-auto">
               {dropTargets.map(target => {
                 const isOver = hoverTargetId === target.id
-                const count = getTargetCount(target)
+                const isExpanded = expandedTargetId === target.id
                 const isGroup = target.kind === 'group'
+                const isNew = target.kind === 'series' && createdIds.has(target.id)
+                const isExistingSeries = target.kind === 'series' && !isNew
+                const count = getTargetCount(target)
+                const eventsInside = isExpanded ? getTargetInstances(target) : []
+
                 return (
-                  <div
-                    key={target.id}
-                    onDragOver={e => {
-                      e.preventDefault()
-                      e.dataTransfer.dropEffect = 'move'
-                      setHoverTargetId(target.id)
-                    }}
-                    onDragLeave={e => {
-                      if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+                  <div key={target.id}>
+                    {/* Divider header — click to expand, drag onto to assign */}
+                    <div
+                      onClick={() => setExpandedTargetId(isExpanded ? null : target.id)}
+                      onDragOver={e => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        e.dataTransfer.dropEffect = 'move'
+                        setHoverTargetId(target.id)
+                      }}
+                      onDragLeave={e => {
+                        if (!e.currentTarget.contains(e.relatedTarget as Node)) setHoverTargetId(null)
+                      }}
+                      onDrop={e => {
+                        e.preventDefault()
+                        const instanceId = e.dataTransfer.getData('text/plain')
+                        if (instanceId) moveInstance(instanceId, target.assignSeriesId)
                         setHoverTargetId(null)
-                      }
-                    }}
-                    onDrop={e => {
-                      e.preventDefault()
-                      const instanceId = e.dataTransfer.getData('text/plain')
-                      if (instanceId) moveInstance(instanceId, target.assignSeriesId)
-                      setHoverTargetId(null)
-                    }}
-                    className={`flex items-center justify-between px-3 py-2 rounded-lg transition-all border-2 ${
-                      isOver ? 'border-gold bg-gold/10' : 'border-transparent hover:bg-cream/60'
-                    }`}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className={`truncate ${isGroup ? 'text-xs font-semibold text-espresso' : 'text-xs font-medium text-walnut/80'}`}>
-                        {isGroup ? '▶ ' : ''}{target.label}
-                        {isGroup && (
-                          <span className="ml-1.5 text-[10px] font-normal text-walnut/40">
-                            {(target as Extract<OrgTarget, { kind: 'group' }>).memberIds.length} series
-                          </span>
+                      }}
+                      className={`flex items-center justify-between px-3 py-2 rounded-lg cursor-pointer select-none border-2 transition-all ${
+                        isOver
+                          ? 'border-gold bg-gold/10'
+                          : isExpanded
+                          ? 'border-walnut/20 bg-cream/50'
+                          : 'border-transparent hover:bg-cream/60'
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className={`truncate ${isGroup ? 'text-xs font-semibold text-espresso' : 'text-xs font-medium text-walnut/80'}`}>
+                          <span className="mr-1 text-[9px] text-walnut/30">{isExpanded ? '▼' : '▶'}</span>
+                          {target.label}
+                          {isGroup && (
+                            <span className="ml-1.5 text-[10px] font-normal text-walnut/40">
+                              {(target as Extract<OrgTarget, { kind: 'group' }>).memberIds.length} series
+                            </span>
+                          )}
+                        </p>
+                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full capitalize ${TAG_STYLES[target.tag]}`}>
+                          {target.tag}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0 ml-2">
+                        {count > 0 && <span className="text-[10px] text-walnut/50">{count}</span>}
+                        {isOver && draggedId && <span className="text-[10px] text-gold font-semibold">drop</span>}
+                        {isNew && (
+                          <button
+                            onClick={e => { e.stopPropagation(); deleteSeries(target.id) }}
+                            title="Delete this series"
+                            className="text-sm leading-none text-walnut/25 hover:text-red-400 transition-colors pl-1"
+                          >
+                            ×
+                          </button>
                         )}
-                      </p>
-                      <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full capitalize ${TAG_STYLES[target.tag]}`}>
-                        {target.tag}
-                      </span>
+                        {isExistingSeries && (
+                          <button
+                            onClick={e => { e.stopPropagation(); archiveSeries(target.id) }}
+                            title="Hide this series"
+                            className="text-xs leading-none text-walnut/20 hover:text-walnut/50 transition-colors pl-1"
+                          >
+                            −
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2 shrink-0 ml-2">
-                      {count > 0 && <span className="text-[10px] text-walnut/50">{count}</span>}
-                      {isOver && draggedId && <span className="text-[10px] text-gold font-semibold">drop</span>}
-                    </div>
+
+                    {/* Expanded: events inside this divider, each draggable */}
+                    {isExpanded && (
+                      <div className="mt-1 space-y-0.5">
+                        {eventsInside.length === 0 ? (
+                          <p className="text-[10px] text-walnut/40 pl-6 py-2">
+                            No events yet — drop events here.
+                          </p>
+                        ) : (
+                          eventsInside.map(inst => <EventRow key={inst.id} inst={inst} indent />)
+                        )}
+                      </div>
+                    )}
                   </div>
                 )
               })}
