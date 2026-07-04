@@ -1533,7 +1533,9 @@ function SeriesOrganizer({
         const p = placements.get(inst.id)
         if (p === UNSORTED_MARKER) return false
         if (p !== undefined) {
-          return target.kind === 'series' ? p === target.assignSeriesId : target.memberIds.includes(p)
+          if (target.kind === 'series') return p === target.assignSeriesId
+          // p can be a member series UUID (old behavior) or the group's rule id (new local-only drag)
+          return target.memberIds.includes(p) || p === target.id
         }
         // Natural position: only if sorted at mount time
         if (!initialSortedSeriesIds.has(inst.seriesId)) return false
@@ -1562,18 +1564,26 @@ function SeriesOrganizer({
       .sort((a, b) => b.date.localeCompare(a.date))
   }, [instances, initialSortedSeriesIds, placements, search])
 
-  async function moveInstance(instanceId: string, assignSeriesId: string) {
-    if (!originalSeriesRef.current.has(instanceId)) {
+  async function moveInstance(instanceId: string, target: OrgTarget) {
+    const isGroup = target.kind === 'group'
+    // Group targets are local-only: no DB write, so the event's series_id never changes
+    // Only individual series targets persist to DB
+    const placementKey = isGroup ? target.id : target.assignSeriesId
+
+    if (!isGroup && !originalSeriesRef.current.has(instanceId)) {
       const inst = instances.find(i => i.id === instanceId)
       if (inst) originalSeriesRef.current.set(instanceId, inst.seriesId)
     }
-    setPlacements(prev => new Map(prev).set(instanceId, assignSeriesId))
+
+    setPlacements(prev => new Map(prev).set(instanceId, placementKey))
+    if (isGroup) return
+
     setSaving(prev => new Set(prev).add(instanceId))
     setErrors(prev => { const m = new Map(prev); m.delete(instanceId); return m })
 
     const { error } = await supabase
       .from('event_instances')
-      .update({ series_id: assignSeriesId })
+      .update({ series_id: target.assignSeriesId })
       .eq('id', instanceId)
 
     setSaving(prev => { const s = new Set(prev); s.delete(instanceId); return s })
@@ -1810,7 +1820,7 @@ function SeriesOrganizer({
                       onDrop={e => {
                         e.preventDefault()
                         const instanceId = e.dataTransfer.getData('text/plain')
-                        if (instanceId) moveInstance(instanceId, target.assignSeriesId)
+                        if (instanceId) moveInstance(instanceId, target)
                         setHoverTargetId(null)
                       }}
                       className={`flex items-center justify-between px-3 py-2 rounded-lg cursor-pointer select-none border-2 transition-all ${
