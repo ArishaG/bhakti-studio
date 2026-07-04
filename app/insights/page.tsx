@@ -1460,10 +1460,13 @@ function SeriesOrganizer({
   })
 
   const dropTargets = useMemo(() => {
+    const createdIds = new Set(createdSeries.map(s => s.id))
     const buckets = new Map<string, SeriesStat[]>(GROUP_RULES.map(r => [r.id, []]))
     const ungrouped: SeriesStat[] = []
 
     for (const s of allSeries.filter(s => !s.isArchived)) {
+      // Skip user-created series from GROUP_RULE matching — they always appear as plain targets
+      if (createdIds.has(s.id)) { ungrouped.push(s); continue }
       const rule = GROUP_RULES.find(r => r.matches(s.name))
       if (rule) buckets.get(rule.id)!.push(s)
       else ungrouped.push(s)
@@ -1486,12 +1489,12 @@ function SeriesOrganizer({
     for (const s of ungrouped) {
       if (seen.has(s.id)) continue
       seen.add(s.id)
-      if (s.instanceCount >= 2) {
+      if (s.instanceCount >= 2 || createdIds.has(s.id)) {
         targets.push({ kind: 'series', id: s.id, label: s.name, tag: s.tag, assignSeriesId: s.id })
       }
     }
 
-    // Always show newly created series as targets (bypass instanceCount >= 2 filter)
+    // Ensure any created series not yet in allSeries (pre-refresh) still appears
     const addedTargetIds = new Set(targets.map(t => t.id))
     for (const s of createdSeries) {
       if (!addedTargetIds.has(s.id)) {
