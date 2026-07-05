@@ -1029,10 +1029,10 @@ function SeriesTable({
         </div>
       </div>
 
-      <div className="bg-parchment rounded-2xl">
-        <div className="overflow-x-auto">
+      <div className="bg-parchment rounded-2xl overflow-hidden">
+        <div className="overflow-x-auto overflow-y-auto max-h-[70vh]">
         <table className="w-full text-sm min-w-[900px]">
-          <thead className="sticky top-16 z-10 bg-parchment">
+          <thead className="sticky top-0 z-10 bg-parchment">
             <tr className="border-b border-cream/80">
               <Th label="Series" sortKey="name" current={sortKey} dir={sortDir} onClick={toggleSort} />
               <th className="text-left px-4 py-2.5 text-xs font-medium text-walnut">Tag</th>
